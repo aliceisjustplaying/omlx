@@ -931,6 +931,71 @@ def test_inkling2_gqa_flash_decode_matches_masked_sdpa(
     assert diff < 1e-2
 
 
+def test_inkling2_markov_q8_greedy_matches_apply_step_logits():
+    import mlx.nn as nn
+
+    from omlx.patches.inkling2.dspark import Inkling2DSparkConfig, Inkling2MarkovHead
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    cfg = Inkling2DSparkConfig(
+        hidden_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=256,
+        rms_norm_eps=1e-6,
+        rope_theta=1e6,
+        local_layer_ids=[0],
+        sliding_window=64,
+        block_size=4,
+        markov_rank=256,
+        target_layer_ids=[0, 1],
+        vocab_size=2048,
+        unpadded_vocab_size=2000,
+        final_logit_softcapping=30.0,
+    )
+    mx.random.seed(19)
+    mh = Inkling2MarkovHead(cfg)
+    lm_head = nn.Linear(128, 2048, bias=False)
+    lm_head.weight = (mx.random.normal((2048, 128)) * 0.2).astype(mx.bfloat16)
+    mh.hidden_out.weight = (mx.random.normal((128, 256)) * 0.1).astype(mx.bfloat16)
+    mh.hidden_out.bias = (mx.random.normal((128,)) * 0.1).astype(mx.bfloat16)
+    mh.fold(lm_head)
+    assert mh._fold_wq is not None and mh._fold_weight is None
+
+    # Put a huge logit in the padded region [2000:2048] to ensure it is masked out.
+    base = (mx.random.normal((2, 3, 2048)) * 2.0).astype(mx.bfloat16)
+    base[:, :, 2005] = mx.array(50.0, dtype=mx.bfloat16)
+    hidden = (mx.random.normal((2, 3, 128)) * 0.2).astype(mx.bfloat16)
+    rows_f = (mx.random.normal((2, 128)) * 0.2).astype(mx.bfloat16)
+    prev0 = mx.array([5, 17], dtype=mx.uint32)
+    mx.eval(base, hidden, rows_f, prev0)
+
+    # Reference via apply_step_logits + argmax
+    mh._hidden, mh._rows_f = hidden, rows_f
+    mh._state = mx.zeros((2, 256), dtype=mx.bfloat16)
+    mh._step = 0
+    ref_toks, p = [], prev0
+    for s in range(3):
+        p = mx.argmax(mh.apply_step_logits(base[:, s], p), axis=-1)
+        ref_toks.append(p)
+
+    # Fused Q8 greedy path
+    mh._state = mx.zeros((2, 256), dtype=mx.bfloat16)
+    mh._step = 0
+    got_toks, p = [], prev0
+    for s in range(3):
+        p = mh.apply_step_greedy(base[:, s], p)
+        got_toks.append(p)
+
+    mx.eval(ref_toks, got_toks)
+    for r, g in zip(ref_toks, got_toks):
+        assert mx.array_equal(r, g)
+        assert mx.all(g < 2000).item()
+
+
 def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
     # NAX hosts run full-attention prefill through the masked path; at 64K
     # keys the masks of all query blocks once took 12 GiB together.
