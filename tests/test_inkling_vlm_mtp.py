@@ -866,6 +866,7 @@ def test_inkling2_affine_expert_carrier_matches_mlx_packing(bits):
         (1, 4, 2, 37, 300, 16, 16, None),
         (1, 6, 2, 100, 300, 0, 32, None),
         (2, 4, 1, 70, 90, 0, 32, [0, 13]),
+        (1, 6, 2, 64, 160, 0, 32, None),
     ],
 )
 def test_inkling2_flash_attention_matches_masked_sdpa(
@@ -931,6 +932,106 @@ def test_inkling2_gqa_flash_decode_matches_masked_sdpa(
     assert diff < 1e-2
 
 
+def test_inkling2_fp8_kv_attention_model_and_98k_budget():
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.patches.inkling2 import cache as windows
+    from omlx.patches.inkling2 import kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+
+    # 1. Bit-exact OCP E4M3 round-trip across all 254 finite codes + overflow clamp.
+    codes = mx.array([c for c in range(256) if (c & 0x7F) != 0x7F], dtype=mx.uint8)
+    dec = kernels.fp8_e4m3_dequantize(codes, mx.float32)
+    reenc = kernels.fp8_e4m3_quantize(dec)
+    mx.eval(dec, reenc)
+    assert mx.array_equal(codes, reenc).item()
+    clamped = kernels.fp8_e4m3_quantize(mx.array([448.0, 900.0, -900.0], dtype=mx.float32))
+    assert clamped.tolist() == [0x7E, 0x7E, 0xFE]
+
+    # 2. Realistic L2-clipped K & unit-RMS V attention parity (decode, verify, prefill, batched).
+    mx.random.seed(29)
+    hq, hkv, d, r, s = 12, 4, 128, 32, 256
+    q_raw = mx.random.normal((2, hq, 64, d))
+    q = (q_raw / (mx.sqrt(mx.sum(q_raw * q_raw, axis=-1, keepdims=True)) + 1e-6) * 10.0).astype(
+        mx.bfloat16
+    )
+    k_raw = mx.random.normal((2, hkv, s, d))
+    k = (k_raw / (mx.sqrt(mx.sum(k_raw * k_raw, axis=-1, keepdims=True)) + 1e-6) * 10.0).astype(
+        mx.bfloat16
+    )
+    v = mx.fast.rms_norm(mx.random.normal((2, hkv, s, d)), None, 1e-6).astype(mx.bfloat16)
+    rel = (mx.random.normal((2, 64, hq, r)) * 0.2).astype(mx.bfloat16)
+    sink = (mx.random.normal((2, 64, hq)) * 1.0).astype(mx.bfloat16)
+    k8, v8 = kernels.fp8_e4m3_quantize(k), kernels.fp8_e4m3_quantize(v)
+    kdq, vdq = kernels.fp8_e4m3_dequantize(k8), kernels.fp8_e4m3_dequantize(v8)
+    lp = mx.array([0, 23], dtype=mx.int32)
+    for b, length, lp_arg in ((1, 1, None), (1, 3, None), (1, 64, None), (2, 1, lp)):
+        o_bf = kernels.banded_sink_attention(
+            q[:b, :, :length], k[:b], v[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        o_f8 = kernels.banded_sink_attention(
+            q[:b, :, :length], k8[:b], v8[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        o_dq = kernels.banded_sink_attention(
+            q[:b, :, :length], kdq[:b], vdq[:b], rel[:b, :length], sink[:b, :length],
+            scale=d**-0.5, window=0, left_padding=lp_arg,
+        )
+        mx.eval(o_bf, o_f8, o_dq)
+        a, b_arr, c_arr = (
+            o_bf.astype(mx.float32).reshape(-1),
+            o_f8.astype(mx.float32).reshape(-1),
+            o_dq.astype(mx.float32).reshape(-1),
+        )
+        cos = (mx.sum(a * b_arr) / (mx.sqrt(mx.sum(a * a)) * mx.sqrt(mx.sum(b_arr * b_arr)))).item()
+        assert cos > 0.998, f"b={b} L={length} cos={cos}"
+        assert mx.abs(b_arr - c_arr).max().item() < 1e-2
+
+    # 3. End-to-end model prefill, verify + rollback, and decode under fp8_kv="all".
+    model = _bf16(_inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOP))
+    ids = mx.random.randint(0, 300, (1, 48))
+    ref_cache = model.make_cache()
+    ref_pre = model(ids[:, :32], cache=ref_cache)[:, -1, :300]
+    ref_dec = model(ids[:, 32:33], cache=ref_cache)[:, -1, :300]
+
+    model.set_fp8_kv("all")
+    fp8_cache = model.make_cache()
+    got_pre = model(ids[:, :32], cache=fp8_cache)[:, -1, :300]
+    got_ver = model(ids[:, 32:36], cache=fp8_cache, return_hidden=True).logits[:, 0, :300]
+    assert model.mtp_partial_rollback(fp8_cache, 0, 3)
+    got_next = model(ids[:, 33:34], cache=fp8_cache)[:, -1, :300]
+    mx.eval(ref_pre, ref_dec, got_pre, got_ver, got_next)
+    for kv, conv in model.model.visit_caches(fp8_cache):
+        arr = kv.keys if kv is not None else conv[windows.KEYS]
+        assert arr.dtype == mx.uint8
+    for a, b_arr in ((ref_pre, got_pre), (ref_dec, got_ver)):
+        af, bf = a.astype(mx.float32).reshape(-1), b_arr.astype(mx.float32).reshape(-1)
+        cos = (mx.sum(af * bf) / (mx.sqrt(mx.sum(af * af)) * mx.sqrt(mx.sum(bf * bf)))).item()
+        assert cos > 0.99
+
+    # 4. Release-size 98k context KV memory budget proof (<= 1.85 GB).
+    window, tokens, chunk = 1024, 98304, 2048
+    state = windows.ArraysCache(window=window)
+    z = mx.zeros((1, 8, chunk, 128), dtype=mx.uint8)
+    for _ in range(tokens // chunk):
+        windows.append(state, z, z)
+        mx.eval(state.cache[windows.KEYS], state.cache[windows.VALUES])
+    one = mx.zeros((1, 8, 1, 128), dtype=mx.uint8)
+    for _ in range(3):
+        windows.append(state, one, one)
+    buf = state.__dict__["_omlx_window"]
+    full = KVCache()
+    full.keys = mx.zeros((1, 8, tokens + 256, 128), dtype=mx.uint8)
+    full.values = mx.zeros((1, 8, tokens + 256, 128), dtype=mx.uint8)
+    total_bytes = 8 * (full.keys.nbytes + full.values.nbytes) + 40 * (
+        buf.keys.nbytes + buf.values.nbytes
+    )
+    assert total_bytes <= 1.85e9, f"98k FP8 KV exceeded 1.85 GB: {total_bytes / 1e9:.3f} GB"
+
+
 def test_inkling2_markov_q8_greedy_matches_apply_step_logits():
     import mlx.nn as nn
 
@@ -994,6 +1095,220 @@ def test_inkling2_markov_q8_greedy_matches_apply_step_logits():
     for r, g in zip(ref_toks, got_toks):
         assert mx.array_equal(r, g)
         assert mx.all(g < 2000).item()
+
+
+def test_inkling2_dspark_2bit_screened_head_exact_argmax_and_conf():
+    import mlx.nn as nn
+
+    from omlx.patches.inkling2.dspark import Inkling2DSparkConfig, Inkling2MarkovHead
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Metal kernel")
+    cfg = Inkling2DSparkConfig(
+        hidden_size=256,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        intermediate_size=512,
+        rms_norm_eps=1e-6,
+        rope_theta=1e6,
+        local_layer_ids=[0, 2],
+        sliding_window=1024,
+        block_size=8,
+        markov_rank=128,
+        target_layer_ids=[0, 1],
+        vocab_size=2048,
+        unpadded_vocab_size=2000,
+        final_logit_softcapping=30.0,
+    )
+    mx.random.seed(31)
+    mh = Inkling2MarkovHead(cfg)
+    mh.markov_w1.weight = (mx.random.normal((2048, 128)) * 0.05).astype(mx.bfloat16)
+    mh.rnn_proj.weight = (mx.random.normal((384, 768)) * 0.05).astype(mx.bfloat16)
+    mh.rnn_proj.bias = (mx.random.normal((384,)) * 0.05).astype(mx.bfloat16)
+    mh.hidden_out.weight = (mx.random.normal((256, 128)) * 0.05).astype(mx.bfloat16)
+    mh.hidden_out.bias = (mx.random.normal((256,)) * 0.05).astype(mx.bfloat16)
+
+    lin = nn.Linear(256, 2048, bias=False)
+    w = (mx.random.normal((2048, 256)) * 0.08).astype(mx.bfloat16)
+    # Place huge weights in the padded tail [2000:2048] to verify masking.
+    w[2005] = mx.full((256,), 5.0, dtype=mx.bfloat16)
+    lin.weight = w
+    lm_head = nn.QuantizedLinear.from_linear(lin, group_size=64, bits=8, mode="affine")
+    mx.eval(lm_head.parameters(), mh.parameters())
+    mh.fold(lm_head)
+    assert mh.screen_enabled
+
+    w_dq = mx.dequantize(lm_head.weight, lm_head.scales, lm_head.biases, 64, 8, mode="affine")
+    n_steps = 20
+    # Batched B=2: row 0 realistic multi-peak with adjacent IDs; row 1 high-confidence peak.
+    h_rows = [[], []]
+    for _ in range(n_steps):
+        base_id = int(mx.random.randint(10, 500, (1,)).item())
+        ids = mx.array([base_id, base_id + 1, base_id + 2, base_id + 3])
+        vecs = w_dq[ids]
+        vecs = vecs / (mx.sqrt(mx.sum(vecs * vecs, axis=-1, keepdims=True)) + 1e-6)
+        h_rows[0].append(
+            mx.sum(vecs * mx.array([2.4, 1.9, 1.4, 1.0])[:, None], axis=0) * 1.4
+            + mx.random.normal((256,)) * 0.5
+        )
+        h_rows[1].append(vecs[0] * 3.5 + mx.random.normal((256,)) * 0.4)
+    hidden = mx.stack([mx.stack(r, axis=0) for r in h_rows], axis=0).astype(mx.bfloat16)
+    rows_f = (mx.random.normal((2, 256)) * 0.2).astype(mx.bfloat16)
+    prev0 = mx.array([5, 17], dtype=mx.uint32)
+    mx.eval(hidden, rows_f, prev0)
+
+    exact_base = lm_head(hidden)
+    mh._hidden, mh._rows_f, mh._rnn_ctx = hidden, rows_f, None
+    mh._state = mx.zeros((2, 128), dtype=mx.bfloat16)
+    mh._step = 0
+    ref_toks, ref_confs = [], []
+    p = prev0
+    for s in range(n_steps):
+        lg = mh.apply_step_logits(exact_base[:, s], p)
+        tok = mx.argmax(lg, axis=-1).astype(mx.uint32)
+        m = mx.max(lg, axis=-1, keepdims=True)
+        conf = (1.0 / mx.sum(mx.exp(lg - m), axis=-1)).astype(mx.float32)
+        ref_toks.append(tok)
+        ref_confs.append(conf)
+        p = tok
+
+    approx_base = mh.screen_base(hidden)
+    mh._hidden, mh._rows_f, mh._rnn_ctx = hidden, rows_f, None
+    mh._state = mx.zeros((2, 128), dtype=mx.bfloat16)
+    mh._step = 0
+    got_toks, got_confs = [], []
+    p = prev0
+    for s in range(n_steps):
+        tok, conf = mh.apply_step_greedy_with_conf(approx_base[:, s], p)
+        got_toks.append(tok)
+        got_confs.append(conf)
+        p = ref_toks[s]
+
+    mx.eval(ref_toks, ref_confs, got_toks, got_confs)
+    matches = 0
+    max_conf_err = 0.0
+    for rt, gt, rc, gc in zip(ref_toks, got_toks, ref_confs, got_confs):
+        assert mx.all(gt < 2000).item()
+        matches += int(mx.sum(rt == gt).item())
+        max_conf_err = max(max_conf_err, float(mx.abs(rc - gc).max().item()))
+    assert matches == 2 * n_steps, f"expected 100% top-1 on peaked logits, got {matches}/{2 * n_steps}"
+    assert max_conf_err <= 0.02, f"conf calibration error {max_conf_err:.4f} > 0.02"
+
+
+def test_inkling2_dspark_layer1_global_context_beyond_window():
+    from types import SimpleNamespace
+
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    from omlx.patches.inkling2.dspark import (
+        Inkling2DSparkConfig,
+        Inkling2DSparkModel,
+        wrap_inkling2_dspark,
+    )
+
+    cfg = Inkling2DSparkConfig(
+        hidden_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=256,
+        rms_norm_eps=1e-6,
+        rope_theta=1e6,
+        local_layer_ids=[0, 2],
+        sliding_window=1024,
+        block_size=8,
+        markov_rank=128,
+        target_layer_ids=[0, 1],
+        vocab_size=2048,
+        unpadded_vocab_size=2000,
+        final_logit_softcapping=30.0,
+    )
+    mx.random.seed(41)
+    dmodel = Inkling2DSparkModel(cfg)
+    dmodel.update(
+        tree_unflatten(
+            [
+                (
+                    k,
+                    mx.ones(v.shape, dtype=mx.bfloat16)
+                    if "norm" in k
+                    else (mx.random.normal(v.shape) * 0.2).astype(mx.bfloat16),
+                )
+                for k, v in tree_flatten(dmodel.parameters())
+            ]
+        )
+    )
+    emb = nn.Embedding(2048, 128)
+    emb.weight = (mx.random.normal((2048, 128)) * 0.08).astype(mx.bfloat16)
+    enorm = nn.RMSNorm(128, eps=1e-6)
+    enorm.weight = enorm.weight.astype(mx.bfloat16)
+    lm_head = nn.Linear(128, 2048, bias=False)
+    lm_head.weight = (mx.random.normal((2048, 128)) * 0.08).astype(mx.bfloat16)
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed=emb, embed_norm=enorm), lm_head=lm_head
+    )
+    dmodel.bind(target)
+    mx.eval(dmodel.parameters(), emb.parameters(), enorm.parameters(), lm_head.parameters())
+
+    # Context > 2,048 tokens: perturb token 0 strongly and compare local layers [0, 2] vs global layer 1.
+    ctx_a = (mx.random.normal((1, 2100, 256)) * 0.1).astype(mx.bfloat16)
+    ctx_b = mx.array(ctx_a)
+    ctx_b[:, 0:1, :] = mx.full((1, 1, 256), 50.0, dtype=mx.bfloat16)
+    mx.eval(ctx_a, ctx_b)
+
+    layer_outs = {0: [], 1: [], 2: []}
+    for idx, layer in enumerate(dmodel.layers):
+        orig = layer.self_attn.o_proj
+
+        def _make_hook(i, fn):
+            def _hook(x):
+                y = fn(x)
+                layer_outs[i].append(y)
+                return y
+
+            return _hook
+
+        layer.self_attn.o_proj = _make_hook(idx, orig)
+
+    da = wrap_inkling2_dspark(dmodel, "test", depth=4)
+    db = wrap_inkling2_dspark(dmodel, "test", depth=4)
+    da.seed(1, [ctx_a[:, :1200, :128], ctx_a[:, :1200, 128:]])
+    da.seed(1, [ctx_a[:, 1200:, :128], ctx_a[:, 1200:, 128:]])
+    db.seed(2, [ctx_b[:, :1200, :128], ctx_b[:, :1200, 128:]])
+    db.seed(2, [ctx_b[:, 1200:, :128], ctx_b[:, 1200:, 128:]])
+
+    st_a = SimpleNamespace(uid=1, depth=4, controller=None)
+    st_b = SimpleNamespace(uid=2, depth=4, controller=None)
+    anchor = mx.array([7], dtype=mx.int32)
+    da.draft([(None, st_a, [], anchor, None)])
+    db.draft([(None, st_b, [], anchor, None)])
+    mx.eval(st_a.drafts, st_b.drafts, *layer_outs[0], *layer_outs[1], *layer_outs[2])
+
+    # Local layers 0 and 2 must respect the 1,023-token sliding window (zero diff from pos 0).
+    assert mx.array_equal(layer_outs[0][0], layer_outs[0][1]).item()
+    assert mx.array_equal(da._cohort.keys[2], db._cohort.keys[2]).item()
+    assert mx.array_equal(da._cohort.values[2], db._cohort.values[2]).item()
+    # Global layer 1 must attend to position 0 (full 2,100-token context).
+    assert da._global_rows[1][1][2] == 2100
+    diff_l1 = mx.abs(layer_outs[1][0].astype(mx.float32) - layer_outs[1][1].astype(mx.float32)).max().item()
+    assert diff_l1 > 1e-3, f"Global layer 1 did not attend to position 0 (diff={diff_l1})"
+
+    # Predraft + adopt_predraft and batched B=2 drafting preserve global layer 1 and emit draft_conf.
+    extra = [(mx.random.normal((1, 4, 128)) * 0.1).astype(mx.bfloat16)] * 2
+    assert da.predraft(
+        None, st_a, extra, mx.array([2], dtype=mx.int32), mx.array([9], dtype=mx.int32)
+    )
+    da.adopt_predraft(st_a, 2)
+    mx.eval(st_a.drafts)
+    assert da._global_rows[1][1][2] >= 2102
+    if mx.default_device() == mx.gpu:
+        assert len(st_a.draft_conf) == 4
+        mx.eval(st_a.draft_conf)
+        assert all(0.0 < float(c.item()) <= 1.0 for c in st_a.draft_conf)
 
 
 def test_inkling2_masked_attention_holds_one_mask_block(monkeypatch):
