@@ -760,10 +760,128 @@ _DSPARK_HEAD_PICK_SOURCE = """
     }
 """
 
+_DSPARK_HEAD_CANDS_SOURCE = (
+    _DSPARK_HEAD_PICK_SOURCE.replace(
+        """        if (tid == 0) {
+            out_tok[b] = 0u;
+            out_conf[b] = 1.0f;
+        }
+        return;""",
+        """        if (tid == 0) {
+            out_tok[b] = 0u;
+            out_conf[b] = 1.0f;
+        }
+        for (uint c = tid; c < K_MAX; c += 256) {
+            size_t oidx = (size_t)b * K_MAX + c;
+            out_ids[oidx] = (c == 0) ? 0u : (V_UNPAD + c);
+            out_logq[oidx] = (c == 0) ? 0.0f : -INFINITY;
+        }
+        return;""",
+    ).replace(
+        """        out_tok[b] = bi;
+        out_conf[b] = 1.0f / total_sum;
+    }""",
+        """        float p_max = 1.0f / total_sum;
+        float temp = sample_params[b * 4 + 0];
+        float top_p = sample_params[b * 4 + 1];
+        uint top_k = (uint)sample_params[b * 4 + 2];
+        float min_p = sample_params[b * 4 + 3];
+        size_t obase = (size_t)b * K_MAX;
+        if (temp <= 0.0f) {
+            out_tok[b] = bi;
+            out_conf[b] = p_max;
+            for (uint c = 0; c < K_MAX; ++c) {
+                out_ids[obase + c] = (c < n_cand) ? tg_vocab[c] : (V_UNPAD + c);
+                out_logq[obase + c] = (c < n_cand && tg_vocab[c] == bi) ? 0.0f : -INFINITY;
+            }
+        } else {
+            uint ord[K_MAX];
+            float raw_p[K_MAX];
+            float sum_cand = 0.0f;
+            for (uint c = 0; c < n_cand; ++c) {
+                ord[c] = c;
+                float ep = metal::exp(tg_ex[c] - bv);
+                raw_p[c] = ep;
+                sum_cand += ep;
+            }
+            float inv_cand = (sum_cand > 0.0f) ? (1.0f / sum_cand) : 1.0f;
+            for (uint i = 1; i < n_cand; ++i) {
+                uint key = ord[i];
+                float kv = tg_ex[key];
+                int j = (int)i - 1;
+                while (j >= 0 && tg_ex[ord[j]] < kv) {
+                    ord[j + 1] = ord[j];
+                    --j;
+                }
+                ord[j + 1] = key;
+            }
+            bool keep[K_MAX];
+            for (uint c = 0; c < n_cand; ++c) keep[c] = false;
+            uint k_lim = (top_k > 0u && top_k < n_cand) ? top_k : n_cand;
+            float min_thr = (min_p > 0.0f) ? (bv + metal::log(min_p)) : -INFINITY;
+            float cum = 0.0f;
+            for (uint i = 0; i < k_lim; ++i) {
+                uint c = ord[i];
+                float p = raw_p[c] * inv_cand;
+                if (i == 0u || ((!(top_p > 0.0f && top_p < 1.0f) || cum < top_p) && tg_ex[c] >= min_thr)) {
+                    keep[c] = true;
+                }
+                cum += p;
+            }
+            float inv_t = 1.0f / temp;
+            float scaled[K_MAX];
+            float smax = -INFINITY;
+            for (uint c = 0; c < n_cand; ++c) {
+                if (keep[c]) {
+                    float s = (tg_ex[c] - bv) * inv_t;
+                    scaled[c] = s;
+                    if (s > smax) smax = s;
+                } else {
+                    scaled[c] = -INFINITY;
+                }
+            }
+            float z = 0.0f;
+            float wt[K_MAX];
+            for (uint c = 0; c < n_cand; ++c) {
+                float w = keep[c] ? metal::exp(scaled[c] - smax) : 0.0f;
+                wt[c] = w;
+                z += w;
+            }
+            float log_z = smax + metal::log(max(z, 1e-30f));
+            float target = u_rand[b] * z;
+            float acc = 0.0f;
+            uint picked = ord[0];
+            bool found = false;
+            for (uint c = 0; c < n_cand; ++c) {
+                if (keep[c]) {
+                    acc += wt[c];
+                    if (!found && acc >= target) {
+                        picked = c;
+                        found = true;
+                    }
+                    out_ids[obase + c] = tg_vocab[c];
+                    out_logq[obase + c] = scaled[c] - log_z;
+                } else {
+                    out_ids[obase + c] = tg_vocab[c];
+                    out_logq[obase + c] = -INFINITY;
+                }
+            }
+            for (uint c = n_cand; c < K_MAX; ++c) {
+                out_ids[obase + c] = V_UNPAD + c;
+                out_logq[obase + c] = -INFINITY;
+            }
+            out_tok[b] = tg_vocab[picked];
+            out_conf[b] = 0.5f + 0.5f * p_max;
+        }
+    }""",
+    )
+)
+
 _dspark_screen_pack_kernel = None
 _dspark_head_base_kernel = None
 _dspark_fold_screen_kernel = None
 _dspark_head_pick_kernel = None
+_dspark_head_cands_kernel = None
 _dspark_markov_step_kernel = None
 _DUMMY_U32 = None
 _DUMMY_BF16 = None
@@ -947,6 +1065,7 @@ def _dspark_screened_pick(
             source=_DSPARK_FOLD_SCREEN_SOURCE,
             header=_DSPARK_LUT2_HEADER,
         )
+    if _dspark_head_pick_kernel is None:
         _dspark_head_pick_kernel = mx.fast.metal_kernel(
             name="omlx_inkling2_dspark_head_pick",
             input_names=[
@@ -1028,6 +1147,136 @@ def _dspark_screened_pick(
         output_dtypes=[mx.uint32, mx.float32],
     )
     return tok, conf
+
+
+def _dspark_screened_candidates(
+    *,
+    h_step: mx.array,
+    lat_step: mx.array,
+    lat_f16: mx.array | None = None,
+    approx_base: mx.array,
+    fold_sc_wq: mx.array,
+    fold_sc_sc: mx.array,
+    fold_bp: mx.array,
+    head_wq: mx.array | None,
+    head_s: mx.array | None,
+    head_b: mx.array | None,
+    head_dense: mx.array | None,
+    head_gs: int,
+    fold_wq: mx.array,
+    fold_s: mx.array,
+    fold_b: mx.array,
+    fold_bias: mx.array,
+    v_unpad: int,
+    t_tiles: int,
+    cap_arr: mx.array,
+    sample_params: mx.array,
+    u_rand: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Stage 1B + Stage 2 + fused in-kernel top-p/temp sampling -> (tok, ids, logq, conf)."""
+    global _dspark_fold_screen_kernel, _dspark_head_cands_kernel
+    if _dspark_fold_screen_kernel is None:
+        _dspark_fold_screen_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_dspark_fold_screen",
+            input_names=[
+                "lat_f16",
+                "fold_wq",
+                "fold_sc",
+                "fold_bp",
+                "approx_base",
+                "cap_arr",
+            ],
+            output_names=["part_out", "cand_v", "cand_r"],
+            source=_DSPARK_FOLD_SCREEN_SOURCE,
+            header=_DSPARK_LUT2_HEADER,
+        )
+    if _dspark_head_cands_kernel is None:
+        _dspark_head_cands_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_dspark_head_sample",
+            input_names=[
+                "cand_v",
+                "cand_r",
+                "part_in",
+                "h_step",
+                "lat_step",
+                "head_wq",
+                "head_s",
+                "head_b",
+                "head_dense",
+                "fold_wq",
+                "fold_s",
+                "fold_b",
+                "fold_bias",
+                "cap_arr",
+                "sample_params",
+                "u_rand",
+            ],
+            output_names=["out_tok", "out_ids", "out_logq", "out_conf"],
+            source=_DSPARK_HEAD_CANDS_SOURCE,
+        )
+    b, r = lat_step.shape
+    h_dim = h_step.shape[-1]
+    if lat_f16 is None:
+        lat_f16 = mx.contiguous(lat_step.astype(mx.float16))
+    ntg_x = (t_tiles + 3) // 4
+    part, cand_v, cand_r = _dspark_fold_screen_kernel(
+        inputs=[lat_f16, fold_sc_wq, fold_sc_sc, fold_bp, approx_base, cap_arr],
+        template=[
+            ("T_TILES", t_tiles),
+            ("R", r),
+            ("R_GROUPS", r // 32),
+            ("V_UNPAD", v_unpad),
+            ("K_PER", _SCREEN_K_PER),
+        ],
+        grid=(ntg_x * 128, b, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[
+            (b, t_tiles, 2),
+            (b, t_tiles * _SCREEN_K_PER),
+            (b, t_tiles * _SCREEN_K_PER),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.uint32],
+    )
+    head_is_q8 = 1 if head_wq is not None else 0
+    wt = head_dense.dtype if head_dense is not None else mx.bfloat16
+    tok, ids, logq, conf = _dspark_head_cands_kernel(
+        inputs=[
+            cand_v,
+            cand_r,
+            part,
+            h_step if h_step.dtype == mx.bfloat16 else h_step.astype(mx.bfloat16),
+            lat_step if lat_step.dtype == mx.bfloat16 else lat_step.astype(mx.bfloat16),
+            head_wq if head_is_q8 else _dummy_u32(),
+            head_s if head_is_q8 else _dummy_bf16(),
+            head_b if head_is_q8 else _dummy_bf16(),
+            head_dense if not head_is_q8 else _dummy_bf16(),
+            fold_wq,
+            fold_s,
+            fold_b,
+            fold_bias,
+            cap_arr,
+            sample_params,
+            u_rand,
+        ],
+        template=[
+            ("WT", wt),
+            ("T_TILES", t_tiles),
+            ("N_CAND_IN", t_tiles * _SCREEN_K_PER),
+            ("K_MAX", _SCREEN_K_MAX_CAND),
+            ("DELTA_VAL", int(_SCREEN_DELTA)),
+            ("H", h_dim),
+            ("R", r),
+            ("HEAD_GS", head_gs),
+            ("FOLD_GS", _MARKOV_FOLD_GROUP_SIZE),
+            ("HEAD_Q8", head_is_q8),
+            ("V_UNPAD", v_unpad),
+        ],
+        grid=(b * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(b,), (b, _SCREEN_K_MAX_CAND), (b, _SCREEN_K_MAX_CAND), (b,)],
+        output_dtypes=[mx.uint32, mx.int32, mx.float32, mx.float32],
+    )
+    return tok, ids, logq, conf
 
 
 def _markov_q8_greedy_argmax(
@@ -1402,6 +1651,41 @@ class Inkling2MarkovHead(nn.Module):
         conf = mx.exp(mx.zeros_like(m[..., 0])) / mx.sum(mx.exp(logits - m), axis=-1)
         return tok, conf.astype(mx.float32)
 
+    def apply_step_candidates_with_conf(
+        self,
+        base_logits: mx.array,
+        prev_tokens: mx.array,
+        sample_params: mx.array,
+        u_rand: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+        """Fused screened exact top-K_MAX sampling + SparseDraftQ + conf."""
+        step_idx = self._step
+        h_step = self._hidden[:, step_idx]
+        latent, lat_f16 = self._step_latent_pair(prev_tokens)
+        return _dspark_screened_candidates(
+            h_step=h_step,
+            lat_step=latent,
+            lat_f16=lat_f16,
+            approx_base=base_logits,
+            fold_sc_wq=self._fold_sc_wq,
+            fold_sc_sc=self._fold_sc_sc,
+            fold_bp=self._fold_bp,
+            head_wq=self._head_wq,
+            head_s=self._head_scales,
+            head_b=self._head_biases,
+            head_dense=self._head_dense,
+            head_gs=self._head_gs,
+            fold_wq=self._fold_wq,
+            fold_s=self._fold_scales,
+            fold_b=self._fold_biases,
+            fold_bias=self._fold_bias,
+            v_unpad=self._unpadded_vocab_size,
+            t_tiles=self._screen_tiles,
+            cap_arr=self._cap_arr,
+            sample_params=sample_params,
+            u_rand=u_rand,
+        )
+
     def prepare_block(self, draft_hidden, context, lengths, uids) -> None:
         """Reset the RNN for a new block; refresh each row's committed taps."""
         rows = []
@@ -1631,6 +1915,8 @@ def _make_inkling2_dspark_drafter_cls():
           per-position calibrated confidence ``state.draft_conf``.
         """
 
+        states_chances = True
+
         def __init__(self, model: Inkling2DSparkModel, **kwargs):
             super().__init__(model, **kwargs)
             n_layers = len(model.layers)
@@ -1690,7 +1976,7 @@ def _make_inkling2_dspark_drafter_cls():
                 gmap = self._global_rows.setdefault(uid, {})
                 for layer_idx, (gk, gv, lengths) in pg.items():
                     gmap[layer_idx] = [gk[0], gv[0], lengths[0]]
-            if pc is not None:
+            if pc is not None and pc[0] is not None:
                 n_keep = self._proposal_count(state)
                 state.draft_conf = pc[0][:n_keep]
                 self._last_conf[state.uid] = state.draft_conf
@@ -2043,15 +2329,42 @@ def _make_inkling2_dspark_drafter_cls():
                     self._remember(row, h_ctx_local[index : index + 1, :ln])
 
             draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
-            if commit and markov is not None:
-                max_proposals = max(
-                    (self._proposal_count(state) for state, *_ in rows), default=0
-                )
-                if 0 < max_proposals < draft_hidden.shape[1]:
-                    draft_hidden = draft_hidden[:, :max_proposals]
-
             samplers = [sampler for *_, sampler in rows]
             greedy = all(sampler is None for sampler in samplers)
+            can_screen_sampled = (
+                markov is not None
+                and markov.screen_enabled
+                and mx.default_device() == mx.gpu
+                and getattr(markov, "_fold_bias", None) is not None
+                and int(markov._fold_bias.shape[0])
+                >= int(markov._unpadded_vocab_size) + _SCREEN_K_MAX_CAND
+            )
+            if markov is not None:
+                if not greedy and not can_screen_sampled:
+                    # Fallback when 2-bit screen isn't available: cap sampled depth.
+                    want = max(
+                        (int(getattr(state, "_policy_k", 3) or 3) for state, *_ in rows),
+                        default=3,
+                    )
+                    max_proposals = max(2, min(4, want + 1))
+                    if max_proposals < draft_hidden.shape[1]:
+                        draft_hidden = draft_hidden[:, :max_proposals]
+                elif can_screen_sampled:
+                    # Slice before prepare_block + screen_base: prose stays at 4 steps
+                    # while code/JSON climbs to 7 and holds across 1-2 cycle dips.
+                    want_s = max(
+                        (int(getattr(state, "_peak_verified_k", 4) or 4) for state, *_ in rows),
+                        default=4,
+                    )
+                    max_proposals = max(4, min(7, want_s + 2))
+                    if max_proposals < draft_hidden.shape[1]:
+                        draft_hidden = draft_hidden[:, :max_proposals]
+                elif commit:
+                    max_proposals = max(
+                        (self._proposal_count(state) for state, *_ in rows), default=0
+                    )
+                    if 0 < max_proposals < draft_hidden.shape[1]:
+                        draft_hidden = draft_hidden[:, :max_proposals]
             if markov is not None:
                 # A predraft's context holds every verify row and only ``counts``
                 # of them commit: the recurrent head starts from the newest
@@ -2089,9 +2402,71 @@ def _make_inkling2_dspark_drafter_cls():
                             self._last_conf[uid] = rc
                     else:
                         self._predraft_conf = row_confs
+                elif can_screen_sampled:
+                    # Fused in-kernel 2-bit screened top-64 exact sampling + SparseDraftQ + conf!
+                    # Single Metal launch per Markov step (same launch count as greedy) while
+                    # preserving exact target distribution via speculative rejection sampling.
+                    from ..mlx_lm_mtp.batch_generator import SparseDraftQ
+
+                    vocab = int(markov._fold_bias.shape[0])
+                    approx_base = markov.screen_base(draft_hidden)
+                    steps = approx_base.shape[1]
+                    params_list = []
+                    for sampler in samplers:
+                        if sampler is None:
+                            params_list.extend([0.0, 0.0, 0.0, 0.0])
+                        else:
+                            params_list.extend(
+                                [
+                                    float(getattr(sampler, "temp", 1.0) or 1.0),
+                                    float(getattr(sampler, "top_p", 0.0) or 0.0),
+                                    float(int(getattr(sampler, "top_k", 0) or 0)),
+                                    float(getattr(sampler, "min_p", 0.0) or 0.0),
+                                ]
+                            )
+                    sample_params = mx.array(params_list, dtype=mx.float32)
+                    u_all = mx.random.uniform(shape=(steps, batch), dtype=mx.float32)
+                    prev = anchors.reshape(-1)
+                    tok_steps, id_steps, logq_steps, conf_steps = [], [], [], []
+                    for step in range(steps):
+                        prev, c_ids, c_logq, conf = markov.apply_step_candidates_with_conf(
+                            approx_base[:, step], prev, sample_params, u_all[step]
+                        )
+                        tok_steps.append(prev)
+                        id_steps.append(c_ids)
+                        logq_steps.append(c_logq)
+                        conf_steps.append(conf)
+                    proposals = []
+                    for index, sampler in enumerate(samplers):
+                        tok_arr = mx.concatenate(
+                            [t[index : index + 1] for t in tok_steps]
+                        ).astype(mx.uint32)
+                        if sampler is None:
+                            proposals.append((tok_arr, []))
+                        else:
+                            q_sparse = SparseDraftQ(
+                                mx.stack([ids[index] for ids in id_steps]),
+                                mx.stack([lq[index] for lq in logq_steps]),
+                                vocab,
+                            )
+                            proposals.append((tok_arr, q_sparse))
+                    row_confs = [
+                        [c[index : index + 1] for c in conf_steps]
+                        for index in range(batch)
+                    ]
+                    if commit:
+                        for uid, rc in zip(uids, row_confs):
+                            self._last_conf[uid] = rc
+                    else:
+                        self._predraft_conf = row_confs
                 else:
                     logits = model._logits(draft_hidden)
                     proposals = selection.select_markov(markov, logits, anchors, samplers)
+                    if commit:
+                        for uid in uids:
+                            self._last_conf.pop(uid, None)
+                    else:
+                        self._predraft_conf = None
             else:
                 logits = model._logits(draft_hidden)
                 proposals = selection.sample_positions(logits, samplers)

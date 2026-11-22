@@ -4208,6 +4208,7 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
         state.chain
         and state.controller is not None
         and _cluster_mtp(gen_batch.model) is None
+        and _draft_policy_for(gen_batch.model) is None
         and state.controller.should_exit()
         and not state.queue
         and result[0].finish_reason is None
@@ -4589,7 +4590,15 @@ def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
         filtered = sampling_logits(combined_lp)
         density = filtered.astype(mx.float32)
         accept_rows = density - mx.logsumexp(density, axis=-1, keepdims=True)
-    q_rows = mx.stack(_dense_q_rows(draft_accept_lps))  # (k, V)
+    if isinstance(draft_accept_lps, SparseDraftQ):
+        q_rows = mx.put_along_axis(
+            mx.full((k, draft_accept_lps.vocab), -float("inf"), dtype=mx.float32),
+            draft_accept_lps.ids[:k],
+            draft_accept_lps.logq[:k],
+            axis=-1,
+        )
+    else:
+        q_rows = mx.stack(_dense_q_rows(draft_accept_lps))  # (k, V)
     idx = drafts.astype(mx.int32)[:, None]
     p_at = mx.take_along_axis(accept_rows[:k], idx, axis=-1).squeeze(-1)
     q_at = mx.take_along_axis(q_rows, idx, axis=-1).squeeze(-1)
@@ -4725,7 +4734,7 @@ def _draft_policy_for(model: Any) -> Optional[Any]:
             break
         flag = None
     if flag is None:
-        flag = os.environ.get(_DRAFT_POLICY_ENV, "").strip().lower() in (
+        flag = os.environ.get(_DRAFT_POLICY_ENV, "1").strip().lower() in (
             "1",
             "true",
             "on",
@@ -4923,13 +4932,20 @@ def _run_verify_cycle_chain(
             _clip_block_drafts(state, policy.window(cycle_conf) - 1)
         elif not state.copy_drafts:
             cycle_conf = None
-            _clip_block_drafts(state, _drafter_window(state))
+            pol_k = policy.choose(
+                drafter_k=min(drafter.depth, int(state.depth or drafter.depth)),
+                drafted=True,
+            ).k
+            state._policy_k = pol_k
+            _clip_block_drafts(state, pol_k)
         # A lookup window was sized by the policy when it was proposed.
     elif drafter is not None and own_forward:
         _clip_block_drafts(state, _drafter_window(state))
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
+    state._last_verified_k = k
+    state._peak_verified_k = max(k, int(getattr(state, "_peak_verified_k", 0) or 0) - 1)
     copy_cycle = state.copy_drafts
     cycle_match, cycle_lookup_drafted = state.lookup_match, state.lookup_drafted
     if cycle_conf is not None:
@@ -5056,10 +5072,7 @@ def _run_verify_cycle_chain(
                 combined_lp,
                 state.drafts,
                 state.draft_accept_lps,
-                # A fast-path miss would also discard the queued pre-draft.
-                allow_nucleus=not (
-                    can_predraft and callable(getattr(drafter, "predraft", None))
-                ),
+                allow_nucleus=True,
             )
             if can_predraft:
                 m_arr = result[:1]
@@ -5071,13 +5084,19 @@ def _run_verify_cycle_chain(
                 predrafted = _predraft(
                     gen_batch, state, drafter, captured, result, m_arr, anchor
                 )
-            host = _settled_verify(
-                result.tolist(),
-                sampler,
-                combined_lp,
-                state.drafts,
-                state.draft_accept_lps,
-            )
+            raw_host = result.tolist()
+            if not raw_host[-1]:
+                if predrafted:
+                    drafter.discard_predraft()
+                    predrafted = False
+                host = _stochastic_verify_tokens(
+                    sampler,
+                    combined_lp,
+                    state.drafts,
+                    state.draft_accept_lps,
+                ).tolist()
+            else:
+                host = raw_host[:-1]
         m = int(host[0])
         draft_ids = host[1 : k + 1]
         res_ids = host[k + 1 : 2 * k + 1]

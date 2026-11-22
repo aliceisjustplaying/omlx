@@ -45,9 +45,9 @@ MAX_ROWS = 16
 K_MAX = MAX_ROWS - 1
 
 # The shape of a round's cost by window size, relative to one row, used until
-# sizes are measured (Basalt's, between its measured curves).
-_SHAPE = (0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6)
-_SHAPE = _SHAPE + tuple(3.6 + 0.35 * i for i in range(1, MAX_ROWS - 7))
+# sizes are measured (measured on Apple M5 Pro with fused packed MoE).
+_SHAPE = (0.0, 1.0, 1.20, 1.40, 1.59, 1.78, 2.05, 2.22, 2.38)
+_SHAPE = _SHAPE + tuple(2.38 + 0.18 * i for i in range(1, MAX_ROWS - 7))
 _SCALE_ALPHA = 0.2
 _COST_ALPHA = 0.1
 # A size's first rounds start from what the other sizes imply, worth this many
@@ -216,7 +216,7 @@ class DraftPolicy:
         margin: float = 0.03,
         timed: bool = True,
         cost_shape: Optional[Sequence[float]] = None,
-        draft_ratio: float = 0.15,
+        draft_ratio: float = 0.04,
         position_prior: Optional[Sequence[float]] = None,
     ) -> None:
         """``timed`` False: round times are not read and every round costs the

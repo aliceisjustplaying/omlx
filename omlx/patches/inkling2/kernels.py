@@ -1846,3 +1846,593 @@ def static_conv4_fused(
         output_dtypes=[x.dtype, mx.float32],
     )
     return out, next_state
+
+
+# ---------------------------------------------------------------------------
+# Fast exact FP32 router and fused multi-row packed MoE kernels (NVFP4 / Affine-4)
+# ---------------------------------------------------------------------------
+
+_FAST_ROUTER_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint e = thread_position_in_grid.y;
+    const uint s = thread_position_in_grid.z;
+    const device T* x = X + size_t(s) * D;
+    const device float* w = RT + size_t(e) * D;
+    float acc = 0.0f;
+    for (uint i = lane * 4u; i < D; i += 128u) {
+        float4 w4 = *(const device float4*)(w + i);
+        acc += float(x[i]) * w4.x + float(x[i + 1u]) * w4.y
+             + float(x[i + 2u]) * w4.z + float(x[i + 3u]) * w4.w;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) SC[size_t(s) * E + e] = acc;
+"""
+
+_PACKED_MOE_HEADER = r"""
+inline float2 _ink2_e2m1x2(uint w, int j) {
+    const uint v = w >> (4 * j);
+    return float2(as_type<half2>(((v & 0x70007u) << 9) | ((v & 0x80008u) << 12)));
+}
+inline float _ink2_fp4_dot16(uint2 w, thread const float* x) {
+    float a = 0.0f, b = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        const float2 p = _ink2_e2m1x2(w.x, j);
+        const float2 q = _ink2_e2m1x2(w.y, j);
+        a += x[j] * p.x + x[j + 4] * p.y;
+        b += x[8 + j] * q.x + x[12 + j] * q.y;
+    }
+    return a + b;
+}
+inline float _ink2_fp4_scale(uint b) {
+    return float(as_type<half>(ushort(((b & 0x7Fu) << 7) | ((b & 0x80u) << 8))));
+}
+inline float _ink2_nvfp4_chunk(
+    const device uint* row,
+    const device uchar* srow,
+    uint c,
+    thread const float* x
+) {
+    const float d = _ink2_fp4_dot16(((const device uint2*)row)[c], x);
+    const float s = _ink2_fp4_scale(uint(srow[c]));
+    return d * s * 4194304.0f;
+}
+template <typename S, int GS>
+inline float _ink2_affine4_chunk(
+    const device uchar* row,
+    const device S* srow,
+    const device S* brow,
+    uint c,
+    thread const float* x
+) {
+    const device uint* p = (const device uint*)(row + c * 8u);
+    uint w0 = p[0], w1 = p[1];
+    float qx = 0.0f, sx = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        float xi = x[i];
+        qx += float((w0 >> (4 * i)) & 0xFu) * xi;
+        sx += xi;
+    }
+    for (int i = 0; i < 8; ++i) {
+        float xi = x[8 + i];
+        qx += float((w1 >> (4 * i)) & 0xFu) * xi;
+        sx += xi;
+    }
+    const uint g = (c * 16u) / GS;
+    return float(srow[g]) * qx + float(brow[g]) * sx;
+}
+"""
+
+_UPS_NVFP4_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint row0 = thread_position_in_grid.y;
+    const uint e = thread_position_in_grid.z;
+    const device T* x = X + size_t(e / KSEL) * K;
+    constexpr uint WPR = K / 8u;
+    constexpr uint SPR = K / 16u;
+    const size_t base = size_t(IDX[e]) * (2u * I) + 2u * row0;
+    const device uint* wrow = WQ + base * WPR;
+    const device uchar* srow = WS + base * SPR;
+    float accg = 0.0f, accu = 0.0f;
+    for (uint k = lane * 16u; k < K; k += 512u) {
+        float xr[16];
+        for (uint i = 0u; i < 16u; ++i) xr[i] = float(x[k + i]);
+        accg += _ink2_nvfp4_chunk(wrow, srow, k >> 4, xr);
+        accu += _ink2_nvfp4_chunk(wrow + WPR, srow + SPR, k >> 4, xr);
+    }
+    const float sc = SC[IDX[e]] * PR[4];
+    const float g = float(T(simd_sum(accg))) * sc;
+    const float u = float(T(simd_sum(accu))) * sc;
+    const float capped =
+        (metal::precise::tanh(g * PR[0]) * PR[1])
+        * (metal::precise::tanh(u * PR[2]) * PR[3]);
+    if (lane == 0u) ACT[size_t(e) * I + row0] = T(capped / (1.0f + metal::precise::exp(-g)));
+"""
+
+_DOWNS_NVFP4_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint e = thread_position_in_grid.y;
+    const uint srow = thread_position_in_grid.z / D;
+    const uint row0 = thread_position_in_grid.z % D;
+    const uint p = srow * KSEL + e;
+    constexpr uint WPR = I / 8u;
+    constexpr uint SPR = I / 16u;
+    threadgroup float part[KSEL];
+    const size_t base = size_t(IDX[p]) * D + row0;
+    const device uint* wrow = WQ + base * WPR;
+    const device uchar* scales = WS + base * SPR;
+    float acc = 0.0f;
+    for (uint k = lane * 16u; k < I; k += 512u) {
+        float xr[16];
+        for (uint i = 0u; i < 16u; ++i) xr[i] = float(ACT[size_t(p) * I + k + i]);
+        acc += _ink2_nvfp4_chunk(wrow, scales, k >> 4, xr);
+    }
+    const float v = float(T(simd_sum(acc))) * (SC[IDX[p]] * PR[0]) * WTS[p];
+    if (lane == 0u) part[e] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e == 0u && lane == 0u) {
+        float total = 0.0f;
+        for (uint k = 0u; k < KSEL; ++k) total += part[k];
+        OUT[size_t(srow) * D + row0] = T(total);
+    }
+"""
+
+_UPS_AFF4_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint row0 = thread_position_in_grid.y;
+    const uint e = thread_position_in_grid.z;
+    const device T* x = X + size_t(e / KSEL) * K;
+    constexpr uint WBR = K / 2u;
+    constexpr uint SPR = K / GS;
+    const size_t base = size_t(IDX[e]) * (2u * I) + 2u * row0;
+    const device uchar* arow = (const device uchar*)WQ + base * WBR;
+    const device S* sa = WS + base * SPR;
+    const device S* ba = WB + base * SPR;
+    float accg = 0.0f, accu = 0.0f;
+    for (uint k = lane * 16u; k < K; k += 512u) {
+        float xr[16];
+        for (uint i = 0u; i < 16u; ++i) xr[i] = float(x[k + i]);
+        accg += _ink2_affine4_chunk<S, GS>(arow, sa, ba, k >> 4, xr);
+        accu += _ink2_affine4_chunk<S, GS>(arow + WBR, sa + SPR, ba + SPR, k >> 4, xr);
+    }
+    const float g = float(T(simd_sum(accg)));
+    const float u = float(T(simd_sum(accu)));
+    const float capped =
+        (metal::precise::tanh(g * PR[0]) * PR[1])
+        * (metal::precise::tanh(u * PR[2]) * PR[3]);
+    if (lane == 0u) ACT[size_t(e) * I + row0] = T(capped / (1.0f + metal::precise::exp(-g)));
+"""
+
+_DOWNS_AFF4_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint e = thread_position_in_grid.y;
+    const uint srow = thread_position_in_grid.z / D;
+    const uint row0 = thread_position_in_grid.z % D;
+    const uint p = srow * KSEL + e;
+    constexpr uint WBR = I / 2u;
+    constexpr uint SPR = I / GS;
+    threadgroup float part[KSEL];
+    const size_t base = size_t(IDX[p]) * D + row0;
+    const device uchar* arow = (const device uchar*)WQ + base * WBR;
+    const device S* sa = WS + base * SPR;
+    const device S* ba = WB + base * SPR;
+    float acc = 0.0f;
+    for (uint k = lane * 16u; k < I; k += 512u) {
+        float xr[16];
+        for (uint i = 0u; i < 16u; ++i) xr[i] = float(ACT[size_t(p) * I + k + i]);
+        acc += _ink2_affine4_chunk<S, GS>(arow, sa, ba, k >> 4, xr);
+    }
+    const float v = float(T(simd_sum(acc))) * WTS[p];
+    if (lane == 0u) part[e] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e == 0u && lane == 0u) {
+        float total = 0.0f;
+        for (uint k = 0u; k < KSEL; ++k) total += part[k];
+        OUT[size_t(srow) * D + row0] = T(total);
+    }
+"""
+
+_MOE_PLAN16_SOURCE = r"""
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint simd = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint n_slots = T_TOK * KSEL;
+    threadgroup uint tg_eids[128];
+    threadgroup uint tg_wsum[4];
+    if (tid < n_slots) tg_eids[tid] = IDX[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint p[4] = {0u, 0u, 0u, 0u};
+    uint my_cnt = 0u, my_nu = 0u;
+    if (tid < 128u) {
+        for (uint s = 0u; s < n_slots; ++s) {
+            if (tg_eids[s] == tid && my_cnt < 16u) {
+                p[my_cnt >> 2] |= (s << ((my_cnt & 3u) * 8u));
+                my_cnt++;
+            }
+        }
+        my_nu = (my_cnt + 3u) >> 2;
+    }
+    uint pfx = 0u;
+    if (tid < 128u) {
+        pfx = simd_prefix_exclusive_sum(my_nu);
+        uint ws = simd_sum(my_nu);
+        if (lane == 0u) tg_wsum[simd] = ws;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) PLAN[0] = tg_wsum[0] + tg_wsum[1] + tg_wsum[2] + tg_wsum[3];
+    if (tid < 128u && my_cnt > 0u) {
+        uint dst = pfx;
+        for (uint w = 0u; w < simd; ++w) dst += tg_wsum[w];
+        for (uint u = 0u; u < my_nu; ++u) {
+            uint rem = my_cnt - u * 4u;
+            uint c = (rem > 4u) ? 4u : rem;
+            PLAN[1u + dst + u] = tid | (c << 8u);
+            PLAN[129u + dst + u] = p[u];
+        }
+    }
+"""
+
+_UPS_NVFP4_GRP_SOURCE = r"""
+    const uint u = thread_position_in_grid.z;
+    if (u >= PLAN[0]) return;
+    const uint lane = thread_index_in_simdgroup;
+    const uint row0 = thread_position_in_grid.y;
+    const uint ec = PLAN[1u + u];
+    const uint eid = ec & 0xFFu;
+    const uint cnt = ec >> 8u;
+    const uint packed = PLAN[129u + u];
+    constexpr uint WPR = K / 8u;
+    constexpr uint SPR = K / 16u;
+    const size_t base = size_t(eid) * (2u * I) + 2u * row0;
+    const device uint* wrow = WQ + base * WPR;
+    const device uchar* srow = WS + base * SPR;
+    const float sc = SC[eid] * PR[4];
+
+    if (cnt == 1u) {
+        const uint s0 = packed & 0xFFu;
+        const device T* x0 = X + size_t(s0 / KSEL) * K;
+        float accg = 0.0f, accu = 0.0f;
+        for (uint k = lane * 16u; k < K; k += 512u) {
+            float xr[16];
+            for (uint i = 0u; i < 16u; ++i) xr[i] = float(x0[k + i]);
+            accg += _ink2_nvfp4_chunk(wrow, srow, k >> 4, xr);
+            accu += _ink2_nvfp4_chunk(wrow + WPR, srow + SPR, k >> 4, xr);
+        }
+        const float g = float(T(simd_sum(accg))) * sc;
+        const float uv = float(T(simd_sum(accu))) * sc;
+        const float capped = (metal::precise::tanh(g * PR[0]) * PR[1]) * (metal::precise::tanh(uv * PR[2]) * PR[3]);
+        if (lane == 0u) ACT[size_t(s0) * I + row0] = T(capped / (1.0f + metal::precise::exp(-g)));
+    } else if (cnt == 2u) {
+        const uint s0 = packed & 0xFFu, s1 = (packed >> 8u) & 0xFFu;
+        const device T* x0 = X + size_t(s0 / KSEL) * K;
+        const device T* x1 = X + size_t(s1 / KSEL) * K;
+        float ag0 = 0.0f, au0 = 0.0f, ag1 = 0.0f, au1 = 0.0f;
+        for (uint k = lane * 16u; k < K; k += 512u) {
+            const uint c = k >> 4;
+            const uint2 gw = ((const device uint2*)wrow)[c];
+            const uint2 uw = ((const device uint2*)(wrow + WPR))[c];
+            const float bs_g = _ink2_fp4_scale(uint(srow[c])) * 4194304.0f;
+            const float bs_u = _ink2_fp4_scale(uint(srow[SPR + c])) * 4194304.0f;
+            float dg0 = 0.0f, du0 = 0.0f, dg1 = 0.0f, du1 = 0.0f;
+            for (int j = 0; j < 4; ++j) {
+                const float2 pg = _ink2_e2m1x2(gw.x, j), qg = _ink2_e2m1x2(gw.y, j);
+                const float2 pu = _ink2_e2m1x2(uw.x, j), qu = _ink2_e2m1x2(uw.y, j);
+                const float a0 = float(x0[k + j]), b0 = float(x0[k + j + 4]), c0 = float(x0[k + j + 8]), d0 = float(x0[k + j + 12]);
+                const float a1 = float(x1[k + j]), b1 = float(x1[k + j + 4]), c1 = float(x1[k + j + 8]), d1 = float(x1[k + j + 12]);
+                dg0 += a0 * pg.x + b0 * pg.y + c0 * qg.x + d0 * qg.y;
+                du0 += a0 * pu.x + b0 * pu.y + c0 * qu.x + d0 * qu.y;
+                dg1 += a1 * pg.x + b1 * pg.y + c1 * qg.x + d1 * qg.y;
+                du1 += a1 * pu.x + b1 * pu.y + c1 * qu.x + d1 * qu.y;
+            }
+            ag0 += dg0 * bs_g; au0 += du0 * bs_u; ag1 += dg1 * bs_g; au1 += du1 * bs_u;
+        }
+        { const float g = float(T(simd_sum(ag0))) * sc, uv = float(T(simd_sum(au0))) * sc;
+          const float cp = (metal::precise::tanh(g * PR[0]) * PR[1]) * (metal::precise::tanh(uv * PR[2]) * PR[3]);
+          if (lane == 0u) ACT[size_t(s0) * I + row0] = T(cp / (1.0f + metal::precise::exp(-g))); }
+        { const float g = float(T(simd_sum(ag1))) * sc, uv = float(T(simd_sum(au1))) * sc;
+          const float cp = (metal::precise::tanh(g * PR[0]) * PR[1]) * (metal::precise::tanh(uv * PR[2]) * PR[3]);
+          if (lane == 0u) ACT[size_t(s1) * I + row0] = T(cp / (1.0f + metal::precise::exp(-g))); }
+    } else {
+        const uint s0 = packed & 0xFFu, s1 = (packed >> 8u) & 0xFFu, s2 = (packed >> 16u) & 0xFFu, s3 = (packed >> 24u) & 0xFFu;
+        const device T* x0 = X + size_t(s0 / KSEL) * K;
+        const device T* x1 = X + size_t(s1 / KSEL) * K;
+        const device T* x2 = X + size_t(s2 / KSEL) * K;
+        const device T* x3 = (cnt >= 4u) ? (X + size_t(s3 / KSEL) * K) : x2;
+        float ag0 = 0.0f, au0 = 0.0f, ag1 = 0.0f, au1 = 0.0f, ag2 = 0.0f, au2 = 0.0f, ag3 = 0.0f, au3 = 0.0f;
+        for (uint k = lane * 16u; k < K; k += 512u) {
+            const uint c = k >> 4;
+            const uint2 gw = ((const device uint2*)wrow)[c];
+            const uint2 uw = ((const device uint2*)(wrow + WPR))[c];
+            const float bs_g = _ink2_fp4_scale(uint(srow[c])) * 4194304.0f;
+            const float bs_u = _ink2_fp4_scale(uint(srow[SPR + c])) * 4194304.0f;
+            float dg0=0.0f,du0=0.0f,dg1=0.0f,du1=0.0f,dg2=0.0f,du2=0.0f,dg3=0.0f,du3=0.0f;
+            for (int j = 0; j < 4; ++j) {
+                const float2 pg = _ink2_e2m1x2(gw.x, j), qg = _ink2_e2m1x2(gw.y, j);
+                const float2 pu = _ink2_e2m1x2(uw.x, j), qu = _ink2_e2m1x2(uw.y, j);
+                const float a0=float(x0[k+j]),b0=float(x0[k+j+4]),c0=float(x0[k+j+8]),d0=float(x0[k+j+12]);
+                const float a1=float(x1[k+j]),b1=float(x1[k+j+4]),c1=float(x1[k+j+8]),d1=float(x1[k+j+12]);
+                const float a2=float(x2[k+j]),b2=float(x2[k+j+4]),c2=float(x2[k+j+8]),d2=float(x2[k+j+12]);
+                const float a3=float(x3[k+j]),b3=float(x3[k+j+4]),c3=float(x3[k+j+8]),d3=float(x3[k+j+12]);
+                dg0+=a0*pg.x+b0*pg.y+c0*qg.x+d0*qg.y; du0+=a0*pu.x+b0*pu.y+c0*qu.x+d0*qu.y;
+                dg1+=a1*pg.x+b1*pg.y+c1*qg.x+d1*qg.y; du1+=a1*pu.x+b1*pu.y+c1*qu.x+d1*qu.y;
+                dg2+=a2*pg.x+b2*pg.y+c2*qg.x+d2*qg.y; du2+=a2*pu.x+b2*pu.y+c2*qu.x+d2*qu.y;
+                dg3+=a3*pg.x+b3*pg.y+c3*qg.x+d3*qg.y; du3+=a3*pu.x+b3*pu.y+c3*qu.x+d3*qu.y;
+            }
+            ag0+=dg0*bs_g; au0+=du0*bs_u; ag1+=dg1*bs_g; au1+=du1*bs_u; ag2+=dg2*bs_g; au2+=du2*bs_u; ag3+=dg3*bs_g; au3+=du3*bs_u;
+        }
+        { const float g=float(T(simd_sum(ag0)))*sc, uv=float(T(simd_sum(au0)))*sc; const float cp=(metal::precise::tanh(g*PR[0])*PR[1])*(metal::precise::tanh(uv*PR[2])*PR[3]); if (lane==0u) ACT[size_t(s0)*I+row0]=T(cp/(1.0f+metal::precise::exp(-g))); }
+        { const float g=float(T(simd_sum(ag1)))*sc, uv=float(T(simd_sum(au1)))*sc; const float cp=(metal::precise::tanh(g*PR[0])*PR[1])*(metal::precise::tanh(uv*PR[2])*PR[3]); if (lane==0u) ACT[size_t(s1)*I+row0]=T(cp/(1.0f+metal::precise::exp(-g))); }
+        { const float g=float(T(simd_sum(ag2)))*sc, uv=float(T(simd_sum(au2)))*sc; const float cp=(metal::precise::tanh(g*PR[0])*PR[1])*(metal::precise::tanh(uv*PR[2])*PR[3]); if (lane==0u) ACT[size_t(s2)*I+row0]=T(cp/(1.0f+metal::precise::exp(-g))); }
+        if (cnt >= 4u) { const float g=float(T(simd_sum(ag3)))*sc, uv=float(T(simd_sum(au3)))*sc; const float cp=(metal::precise::tanh(g*PR[0])*PR[1])*(metal::precise::tanh(uv*PR[2])*PR[3]); if (lane==0u) ACT[size_t(s3)*I+row0]=T(cp/(1.0f+metal::precise::exp(-g))); }
+    }
+"""
+
+_DOWNS_NVFP4_GRP_SOURCE = r"""
+    const uint u = thread_position_in_grid.z;
+    if (u >= PLAN[0]) return;
+    const uint lane = thread_index_in_simdgroup;
+    const uint row0 = thread_position_in_grid.y;
+    const uint ec = PLAN[1u + u];
+    const uint eid = ec & 0xFFu;
+    const uint cnt = ec >> 8u;
+    const uint packed = PLAN[129u + u];
+    constexpr uint WPR = I / 8u;
+    constexpr uint SPR = I / 16u;
+    const size_t base = size_t(eid) * D + row0;
+    const device uint* wrow = WQ + base * WPR;
+    const device uchar* srow = WS + base * SPR;
+    const float sc = SC[eid] * PR[0];
+
+    if (cnt == 1u) {
+        const uint s0 = packed & 0xFFu;
+        const device T* a0 = ACT + size_t(s0) * I;
+        float acc = 0.0f;
+        for (uint k = lane * 16u; k < I; k += 512u) {
+            float xr[16];
+            for (uint i = 0u; i < 16u; ++i) xr[i] = float(a0[k + i]);
+            acc += _ink2_nvfp4_chunk(wrow, srow, k >> 4, xr);
+        }
+        const float v = float(T(simd_sum(acc))) * sc * WTS[s0];
+        if (lane == 0u) YSLOT[size_t(s0) * D + row0] = v;
+    } else if (cnt == 2u) {
+        const uint s0 = packed & 0xFFu, s1 = (packed >> 8u) & 0xFFu;
+        const device T* a0 = ACT + size_t(s0) * I;
+        const device T* a1 = ACT + size_t(s1) * I;
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (uint k = lane * 16u; k < I; k += 512u) {
+            const uint c = k >> 4;
+            const uint2 w = ((const device uint2*)wrow)[c];
+            const float bs = _ink2_fp4_scale(uint(srow[c])) * 4194304.0f;
+            float d0 = 0.0f, d1 = 0.0f;
+            for (int j = 0; j < 4; ++j) {
+                const float2 p = _ink2_e2m1x2(w.x, j), q = _ink2_e2m1x2(w.y, j);
+                d0 += float(a0[k+j])*p.x + float(a0[k+j+4])*p.y + float(a0[k+j+8])*q.x + float(a0[k+j+12])*q.y;
+                d1 += float(a1[k+j])*p.x + float(a1[k+j+4])*p.y + float(a1[k+j+8])*q.x + float(a1[k+j+12])*q.y;
+            }
+            acc0 += d0 * bs; acc1 += d1 * bs;
+        }
+        const float v0 = float(T(simd_sum(acc0))) * sc * WTS[s0];
+        const float v1 = float(T(simd_sum(acc1))) * sc * WTS[s1];
+        if (lane == 0u) { YSLOT[size_t(s0) * D + row0] = v0; YSLOT[size_t(s1) * D + row0] = v1; }
+    } else {
+        const uint s0 = packed & 0xFFu, s1 = (packed >> 8u) & 0xFFu, s2 = (packed >> 16u) & 0xFFu, s3 = (packed >> 24u) & 0xFFu;
+        const device T* a0 = ACT + size_t(s0) * I;
+        const device T* a1 = ACT + size_t(s1) * I;
+        const device T* a2 = ACT + size_t(s2) * I;
+        const device T* a3 = (cnt >= 4u) ? (ACT + size_t(s3) * I) : a2;
+        float acc0=0.0f, acc1=0.0f, acc2=0.0f, acc3=0.0f;
+        for (uint k = lane * 16u; k < I; k += 512u) {
+            const uint c = k >> 4;
+            const uint2 w = ((const device uint2*)wrow)[c];
+            const float bs = _ink2_fp4_scale(uint(srow[c])) * 4194304.0f;
+            float d0=0.0f,d1=0.0f,d2=0.0f,d3=0.0f;
+            for (int j = 0; j < 4; ++j) {
+                const float2 p = _ink2_e2m1x2(w.x, j), q = _ink2_e2m1x2(w.y, j);
+                d0 += float(a0[k+j])*p.x + float(a0[k+j+4])*p.y + float(a0[k+j+8])*q.x + float(a0[k+j+12])*q.y;
+                d1 += float(a1[k+j])*p.x + float(a1[k+j+4])*p.y + float(a1[k+j+8])*q.x + float(a1[k+j+12])*q.y;
+                d2 += float(a2[k+j])*p.x + float(a2[k+j+4])*p.y + float(a2[k+j+8])*q.x + float(a2[k+j+12])*q.y;
+                d3 += float(a3[k+j])*p.x + float(a3[k+j+4])*p.y + float(a3[k+j+8])*q.x + float(a3[k+j+12])*q.y;
+            }
+            acc0+=d0*bs; acc1+=d1*bs; acc2+=d2*bs; acc3+=d3*bs;
+        }
+        const float v0=float(T(simd_sum(acc0)))*sc*WTS[s0], v1=float(T(simd_sum(acc1)))*sc*WTS[s1], v2=float(T(simd_sum(acc2)))*sc*WTS[s2], v3=float(T(simd_sum(acc3)))*sc*WTS[s3];
+        if (lane == 0u) { YSLOT[size_t(s0)*D+row0]=v0; YSLOT[size_t(s1)*D+row0]=v1; YSLOT[size_t(s2)*D+row0]=v2; if (cnt>=4u) YSLOT[size_t(s3)*D+row0]=v3; }
+    }
+"""
+
+_MOE_COMB_SOURCE = r"""
+    const uint col = thread_position_in_grid.x;
+    const uint tok = thread_position_in_grid.y;
+    if (col >= D) return;
+    const size_t base = size_t(tok) * KSEL * D + col;
+    float s = 0.0f;
+    for (uint k = 0u; k < KSEL; ++k) s += YSLOT[base + size_t(k) * D];
+    OUT[size_t(tok) * D + col] = T(s);
+"""
+
+_fast_router_kernel = None
+_ups_nvfp4_kernel = None
+_downs_nvfp4_kernel = None
+_ups_aff4_kernel = None
+_downs_aff4_kernel = None
+_moe_plan16_kernel = None
+_ups_nvfp4_grp_kernel = None
+_downs_nvfp4_grp_kernel = None
+_moe_comb_kernel = None
+
+
+def fast_router_logits(x: mx.array, router_weight: mx.array) -> mx.array:
+    """Exact FP32 router dot product for small batches (avoids M5 NAX slow TF32 path)."""
+    global _fast_router_kernel
+    if _fast_router_kernel is None:
+        _fast_router_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_fast_router",
+            input_names=["X", "RT"],
+            output_names=["SC"],
+            source=_FAST_ROUTER_SOURCE,
+        )
+    rows, hidden = x.shape
+    experts = router_weight.shape[0]
+    return _fast_router_kernel(
+        inputs=[x, router_weight],
+        template=[("T", x.dtype), ("D", hidden), ("E", experts)],
+        grid=(32, experts, rows),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(rows, experts)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def moe_fused_packed(
+    x: mx.array,
+    w13,
+    w2,
+    inds: mx.array,
+    weights: mx.array,
+    up_params: mx.array,
+    dn_params: mx.array,
+) -> mx.array:
+    """Fused multi-row (1..16) packed NVFP4 (grouped for 3..16) or Affine-4 MoE."""
+    global _ups_nvfp4_kernel, _downs_nvfp4_kernel, _ups_aff4_kernel, _downs_aff4_kernel
+    global _moe_plan16_kernel, _ups_nvfp4_grp_kernel, _downs_nvfp4_grp_kernel, _moe_comb_kernel
+    rows, hidden = x.shape
+    top_k = inds.shape[1]
+    inter = w13.weight.shape[1] // 2
+    idx_f = inds.reshape(-1).astype(mx.uint32)
+    wts_f = weights.reshape(-1).astype(mx.float32)
+    if w13.mode == "nvfp4":
+        if rows >= 3 and w13.weight.shape[0] <= 128:
+            if _moe_plan16_kernel is None:
+                _moe_plan16_kernel = mx.fast.metal_kernel(
+                    name="omlx_inkling2_moe_plan16",
+                    input_names=["IDX"],
+                    output_names=["PLAN"],
+                    source=_MOE_PLAN16_SOURCE,
+                )
+                _ups_nvfp4_grp_kernel = mx.fast.metal_kernel(
+                    name="omlx_inkling2_ups_nvfp4_grp",
+                    input_names=["X", "WQ", "WS", "SC", "PR", "PLAN"],
+                    output_names=["ACT"],
+                    source=_UPS_NVFP4_GRP_SOURCE,
+                    header=_PACKED_MOE_HEADER,
+                )
+                _downs_nvfp4_grp_kernel = mx.fast.metal_kernel(
+                    name="omlx_inkling2_downs_nvfp4_grp",
+                    input_names=["ACT", "WQ", "WS", "SC", "WTS", "PR", "PLAN"],
+                    output_names=["YSLOT"],
+                    source=_DOWNS_NVFP4_GRP_SOURCE,
+                    header=_PACKED_MOE_HEADER,
+                )
+                _moe_comb_kernel = mx.fast.metal_kernel(
+                    name="omlx_inkling2_moe_comb",
+                    input_names=["YSLOT"],
+                    output_names=["OUT"],
+                    source=_MOE_COMB_SOURCE,
+                )
+            plan = _moe_plan16_kernel(
+                inputs=[idx_f],
+                template=[("T_TOK", rows), ("KSEL", top_k)],
+                grid=(256, 1, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(257,)],
+                output_dtypes=[mx.uint32],
+            )[0]
+            act = _ups_nvfp4_grp_kernel(
+                inputs=[x, w13.weight, w13.scales, w13.global_scale, up_params, plan],
+                template=[("T", x.dtype), ("K", hidden), ("I", inter), ("KSEL", top_k)],
+                grid=(32, inter, rows * top_k),
+                threadgroup=(32, 2, 1),
+                output_shapes=[(rows * top_k, inter)],
+                output_dtypes=[x.dtype],
+            )[0]
+            yslot = _downs_nvfp4_grp_kernel(
+                inputs=[act, w2.weight, w2.scales, w2.global_scale, wts_f, dn_params, plan],
+                template=[("T", x.dtype), ("I", inter), ("D", hidden)],
+                grid=(32, hidden, rows * top_k),
+                threadgroup=(32, 2, 1),
+                output_shapes=[(rows * top_k, hidden)],
+                output_dtypes=[mx.float32],
+            )[0]
+            return _moe_comb_kernel(
+                inputs=[yslot],
+                template=[("T", x.dtype), ("D", hidden), ("KSEL", top_k)],
+                grid=(hidden, rows, 1),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(rows, hidden)],
+                output_dtypes=[x.dtype],
+            )[0]
+        if _ups_nvfp4_kernel is None:
+            _ups_nvfp4_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_ups_nvfp4",
+                input_names=["X", "WQ", "WS", "IDX", "SC", "PR"],
+                output_names=["ACT"],
+                source=_UPS_NVFP4_SOURCE,
+                header=_PACKED_MOE_HEADER,
+            )
+            _downs_nvfp4_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_downs_nvfp4",
+                input_names=["ACT", "WQ", "WS", "IDX", "SC", "WTS", "PR"],
+                output_names=["OUT"],
+                source=_DOWNS_NVFP4_SOURCE,
+                header=_PACKED_MOE_HEADER,
+            )
+        act = _ups_nvfp4_kernel(
+            inputs=[x, w13.weight, w13.scales, idx_f, w13.global_scale, up_params],
+            template=[("T", x.dtype), ("K", hidden), ("I", inter), ("KSEL", top_k)],
+            grid=(32, inter, rows * top_k),
+            threadgroup=(32, 2, 1),
+            output_shapes=[(rows * top_k, inter)],
+            output_dtypes=[x.dtype],
+        )[0]
+        return _downs_nvfp4_kernel(
+            inputs=[act, w2.weight, w2.scales, idx_f, w2.global_scale, wts_f, dn_params],
+            template=[("T", x.dtype), ("D", hidden), ("I", inter), ("KSEL", top_k)],
+            grid=(32, top_k, rows * hidden),
+            threadgroup=(32, top_k, 1),
+            output_shapes=[(rows, hidden)],
+            output_dtypes=[x.dtype],
+        )[0]
+    if _ups_aff4_kernel is None:
+        _ups_aff4_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_ups_aff4",
+            input_names=["X", "WQ", "WS", "WB", "IDX", "PR"],
+            output_names=["ACT"],
+            source=_UPS_AFF4_SOURCE,
+            header=_PACKED_MOE_HEADER,
+        )
+        _downs_aff4_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_downs_aff4",
+            input_names=["ACT", "WQ", "WS", "WB", "IDX", "WTS"],
+            output_names=["OUT"],
+            source=_DOWNS_AFF4_SOURCE,
+            header=_PACKED_MOE_HEADER,
+        )
+    act = _ups_aff4_kernel(
+        inputs=[x, w13.weight, w13.scales, w13.biases, idx_f, up_params],
+        template=[
+            ("T", x.dtype),
+            ("S", w13.scales.dtype),
+            ("GS", w13.group_size),
+            ("K", hidden),
+            ("I", inter),
+            ("KSEL", top_k),
+        ],
+        grid=(32, inter, rows * top_k),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(rows * top_k, inter)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return _downs_aff4_kernel(
+        inputs=[act, w2.weight, w2.scales, w2.biases, idx_f, wts_f],
+        template=[
+            ("T", x.dtype),
+            ("S", w2.scales.dtype),
+            ("GS", w2.group_size),
+            ("D", hidden),
+            ("I", inter),
+            ("KSEL", top_k),
+        ],
+        grid=(32, top_k, rows * hidden),
+        threadgroup=(32, top_k, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[x.dtype],
+    )[0]

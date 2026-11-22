@@ -88,11 +88,13 @@ class TextArgs:
         if "conv_kernel_size" in params:
             args.sconv_kernel_size = int(params["conv_kernel_size"])
         if "fp8_kv" not in params:
-            env = os.environ.get("OMLX_INKLING2_FP8_KV", "").strip().lower()
+            env = os.environ.get("OMLX_INKLING2_FP8_KV", "all").strip().lower()
             if env in ("1", "true", "yes", "all"):
                 args.fp8_kv = "all"
             elif env == "full":
                 args.fp8_kv = "full"
+            else:
+                args.fp8_kv = False
         return args
 
     def uses_fp8_kv(self, layer_idx: int) -> bool:
@@ -308,8 +310,38 @@ class Inkling2Experts(nn.Module):
             [args.mlp_gate_softcap, args.mlp_up_softcap, 1.0 / _NVFP4_DENOMINATOR],
             dtype=mx.float32,
         )
+        self._packed_up_params = mx.array(
+            [
+                1.0 / args.mlp_gate_softcap,
+                args.mlp_gate_softcap,
+                1.0 / args.mlp_up_softcap,
+                args.mlp_up_softcap,
+                1.0 / _NVFP4_DENOMINATOR,
+            ],
+            dtype=mx.float32,
+        )
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
+        if (
+            x.shape[0] <= 16
+            and mx.default_device() == mx.gpu
+            and self.w13.bits == 4
+            and self.w2.bits == 4
+            and self.w13.mode == self.w2.mode
+            and self.w13.mode in ("nvfp4", "affine")
+            and x.shape[1] % 16 == 0
+            and self.w13.weight.shape[1] % 32 == 0
+            and inds.shape[1] <= 8
+        ):
+            return kernels.moe_fused_packed(
+                x,
+                self.w13,
+                self.w2,
+                inds,
+                weights,
+                self._packed_up_params,
+                self._inv_nvfp4,
+            )
         xe = mx.expand_dims(x, (-2, -3))
         do_sort = inds.size >= 64
         idx = inds
@@ -355,7 +387,10 @@ class Inkling2MoE(nn.Module):
         self.experts = Inkling2Experts(args, w13_spec, w2_spec)
 
     def route(self, x: mx.array):
-        logits = x.astype(mx.float32) @ self.router_weight.T
+        if x.shape[0] <= 16 and x.shape[1] % 4 == 0 and mx.default_device() == mx.gpu:
+            logits = kernels.fast_router_logits(x, self.router_weight)
+        else:
+            logits = x.astype(mx.float32) @ self.router_weight.T
         return kernels.route_topk(
             logits, self.router_bias, self.top_k, self.route_scale
         )
@@ -1048,6 +1083,8 @@ class Model(nn.Module):
 
     # Rows that accept different counts would need a ragged conv rollback.
     _omlx_drafter_single_row = True
+    # Compiled stages and banded-sink attention handle up to 16 rows in one verify.
+    _omlx_mtp_max_verify_rows = 16
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         """Drop the rejected drafts of a ``num_drafts + 1``-token verify."""
