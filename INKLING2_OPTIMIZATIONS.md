@@ -4,7 +4,7 @@ This fork extends [`jundot/omlx`](https://github.com/jundot/omlx) and [`masterfa
 
 On an **Apple M5 Pro (48 GB unified memory)**, this branch reaches **1,415 tok/s** cold prefill at 6.7K (`4.93s` TTFT), **1,398 tok/s** at 27K (`15.24s`) and **1,120 tok/s** at 54K (+64.5% faster long-context prefill vs before the M5 Metal 4 and fusion patches), **86–115 tok/s** on short coding/editing tasks and **45–53 tok/s** sampled decode from 6.7K to 54K context (**0.25–0.66s** warm TTFT on full-prefix retries).
 
-> **Default tradeoff**: This branch defaults `OMLX_INKLING2_FP8_KV` to `"all"` (lossy unit-scale FP8 E4M3 KV cache across all attention layers) for long-context throughput and memory headroom. Set `OMLX_INKLING2_FP8_KV=0` for BF16 KV cache.
+> **KV cache default**: This branch keeps the BF16 KV cache by default. Set `OMLX_INKLING2_FP8_KV=all` (FP8 E4M3 on all attention layers) or `full` (full-attention layers only) for long-context memory headroom; the FP8 cache is lossy and can lengthen reasoning (see Known Limits).
 
 ## What This Branch Changes
 
@@ -14,7 +14,7 @@ Every change sits in five files layered cleanly on top of `masterfasa/omlx@e1bff
 | :--- | :---: | :--- |
 | [`omlx/patches/inkling2/kernels.py`](omlx/patches/inkling2/kernels.py) | `+1,731 / -6` | Exact FP32/BF16 vectorized router, fused conv+residual, zero-copy strided `fused_head_prep` and `fused_gated_output`, packed NVFP4/Affine-4 MoE (`L=1..2`), bit-exact grouped-16 NVFP4 MoE (`L=3..16`), M5 Metal 4 `matmul2d` FlashAttention and batched MoE prefill |
 | [`omlx/patches/inkling2/dspark.py`](omlx/patches/inkling2/dspark.py) | `+383 / -8` | Fused in-kernel 2-bit screened top-64 sampled DSpark head (`_DSPARK_HEAD_CANDS_SOURCE`), emitting `SparseDraftQ` + calibrated confidence with adaptive step slicing (`4` prose, up to `7` code/JSON) |
-| [`omlx/patches/inkling2/model.py`](omlx/patches/inkling2/model.py) | `+202 / -35` | Wires `fast_router_logits` (with bit-exact BF16 router cache), `_wide_linear` 8-bit prefill GEMMs, `fused_head_prep`, `fused_gated_output`, `moe_fused_packed`, `moe_prefill_nax` and fused conv+residual into `Inkling2Layer`/`Inkling2Attention`/`Inkling2MoE`, raises `_omlx_mtp_max_verify_rows = 16` and defaults `OMLX_INKLING2_FP8_KV` to `"all"` |
+| [`omlx/patches/inkling2/model.py`](omlx/patches/inkling2/model.py) | `+202 / -35` | Wires `fast_router_logits` (with bit-exact BF16 router cache), `_wide_linear` 8-bit prefill GEMMs, `fused_head_prep`, `fused_gated_output`, `moe_fused_packed`, `moe_prefill_nax` and fused conv+residual into `Inkling2Layer`/`Inkling2Attention`/`Inkling2MoE` and raises `_omlx_mtp_max_verify_rows = 16` |
 | [`omlx/patches/mlx_lm_mtp/batch_generator.py`](omlx/patches/mlx_lm_mtp/batch_generator.py) | `+33 / -14` | Sparse top-512 nucleus verify (`allow_nucleus=True`) alongside `predraft` with clean fallback, vectorized `SparseDraftQ` scatter, `OMLX_MTP_DRAFT_POLICY="1"` default and preventing `_park_mtp_to_standard` from parking `DraftPolicy` sessions |
 | [`omlx/speculative/draft_policy.py`](omlx/speculative/draft_policy.py) | `+4 / -4` | Calibrates initial `_SHAPE` cost curve and `draft_ratio = 0.04` for M5 Pro fused MoE timings |
 
@@ -55,7 +55,7 @@ This branch adds `_DSPARK_HEAD_CANDS_SOURCE` (`_dspark_screened_candidates` / `a
 
 This branch builds directly on `masterfasa/omlx`'s `feat/inkling2-basalt-combined` (PRs #5505–#5511), which already provides:
 
-- Unit-scale FP8 E4M3 KV cache (this branch flips `OMLX_INKLING2_FP8_KV` default to `"all"`).
+- Unit-scale FP8 E4M3 KV cache (opt-in through `OMLX_INKLING2_FP8_KV`).
 - GQA-packed Split-K FlashDecoding.
 - Fused Metal BF16 loop controller.
 - 2-bit screened exact greedy DSpark head and global layer-1 draft KV cache.
@@ -114,7 +114,7 @@ For context, here are measurements taken on the same M5 Pro against `ddalcu/mlx-
 
 - **MoE & router kernels**: Exact relative to the loaded `oQ4e` checkpoint (`0.000000` max difference vs single-row decode for grouped NVFP4 MoE).
 - **Sampled DSpark speculation**: Exact relative to the loaded checkpoint's target distribution via speculative rejection sampling.
-- **KV cache (`OMLX_INKLING2_FP8_KV`)**: Defaults to `"all"` (unit-scale FP8 E4M3 across all attention layers) for long-context speed and memory savings. This is lossy KV quantization; set `OMLX_INKLING2_FP8_KV=full` to apply FP8 KV only to full-attention layers or `OMLX_INKLING2_FP8_KV=0` for BF16 KV.
+- **KV cache (`OMLX_INKLING2_FP8_KV`)**: Defaults to BF16. Set `OMLX_INKLING2_FP8_KV=all` (unit-scale FP8 E4M3 across all attention layers) or `full` (full-attention layers only) for long-context memory savings. This is lossy KV quantization.
 
 ## Install & Run
 
@@ -151,13 +151,13 @@ curl -s http://127.0.0.1:8000/v1/models
 
 | Variable | Default in This Branch | Options / Effect |
 | :--- | :---: | :--- |
-| `OMLX_INKLING2_FP8_KV` | `"all"` | `"all"` (FP8 E4M3 KV on all layers), `"full"` (full-attention layers only) or `"0"` (BF16 KV) |
+| `OMLX_INKLING2_FP8_KV` | `"0"` | `"0"` (BF16 KV), `"all"` (FP8 E4M3 KV on all layers) or `"full"` (full-attention layers only) |
 | `OMLX_MTP_DRAFT_POLICY` | `"1"` | `"1"` (adaptive `DraftPolicy` enabled) or `"0"` (disable `DraftPolicy`) |
 
 ## Known Limits
 
 - **Hardware coverage**: The decode Metal kernels use standard Metal SIMD operations and are expected to compile on M1–M4 Macs; the Metal 4 `matmul2d` prefill kernels (`flash_banded_attention_nax` and `moe_prefill_nax`) require Apple Silicon with Metal 4 Neural Accelerators (M5+) and automatically probe layout support (`can_use_nax_attn()` / `can_use_nax_moe()`), falling back cleanly on M1–M4 or older macOS. All kernels were developed and tested on an Apple M5 Pro (48 GB, macOS 27.3, `mlx==0.32.4`). `DraftPolicy` adapts online to measured round timings, while its initial `_SHAPE` prior is tuned for M5 Pro.
-- **FP8 KV quality**: `OMLX_INKLING2_FP8_KV="all"` was smoke-tested on coding, JSON, tool-calling and long-context prompts rather than evaluated on a formal perplexity benchmark. Switch to `OMLX_INKLING2_FP8_KV=full` or `0` if you need exact BF16 KV.
+- **FP8 KV quality**: `OMLX_INKLING2_FP8_KV="all"` was smoke-tested on coding, JSON, tool-calling and long-context prompts rather than evaluated on a formal perplexity benchmark. On a 2.3K-token file-rewrite prompt (temperature 0.6, 3072-token cap), it pushed 4 of 6 runs past 6,000 reasoning characters into the cap, while BF16 KV finished 6 of 6 under 1,000. Keep BF16 KV unless you need the memory.
 - **Checkpoint scope**: `moe_fused_packed` targets 4-bit `nvfp4` and `affine` MoE weights (`L <= 16`, up to 8 experts per token). Other bit widths automatically fall back to MLX's standard path.
 - **Concurrency**: Benchmarks cover single-request decode. High-concurrency multi-user batching was not benchmarked.
 - **Upstream sync**: `jundot/omlx` and `masterfasa/omlx` evolve rapidly; this branch is a snapshot based on `masterfasa/omlx@e1bffb9`.
