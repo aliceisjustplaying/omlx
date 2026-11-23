@@ -1,8 +1,8 @@
 # Inkling 2 Mini Optimizations for Apple Silicon (M5 Pro)
 
-This fork extends [`jundot/omlx`](https://github.com/jundot/omlx) and [`masterfasa/omlx`](https://github.com/masterfasa/omlx) (`feat/inkling2-basalt-combined`, commit `e1bffb9`) with five targeted Python and Metal kernel changes (`+2,057 / -47` lines) for **Inkling 2 Mini** (`oQ4e` mixed 4-bit NVFP4/Affine-4 experts with its bundled **DSpark** recurrent draft head) on Apple Silicon.
+This fork extends [`jundot/omlx`](https://github.com/jundot/omlx) and [`masterfasa/omlx`](https://github.com/masterfasa/omlx) (`feat/inkling2-basalt-combined`, commit `e1bffb9`) with five targeted Python and Metal kernel changes (`+2,353 / -67` lines) for **Inkling 2 Mini** (`oQ4e` mixed 4-bit NVFP4/Affine-4 experts with its bundled **DSpark** recurrent draft head) on Apple Silicon.
 
-On an **Apple M5 Pro (48 GB unified memory)**, this branch reaches up to **1,376 tok/s** prefill at 27K context and **1,103 tok/s** at 54K (+62% faster long-context prefill vs before the M5 Metal 4 `matmul2d` kernels), **86–115 tok/s** on short coding/editing tasks and **46–51 tok/s** sampled decode from 6.7K to 54K context (**0.26–0.63s** warm TTFT on full-prefix retries).
+On an **Apple M5 Pro (48 GB unified memory)**, this branch reaches **1,415 tok/s** cold prefill at 6.7K (`4.93s` TTFT), **1,398 tok/s** at 27K (`15.24s`) and **1,120 tok/s** at 54K (+64.5% faster long-context prefill vs before the M5 Metal 4 and fusion patches), **86–115 tok/s** on short coding/editing tasks and **45–53 tok/s** sampled decode from 6.7K to 54K context (**0.25–0.66s** warm TTFT on full-prefix retries).
 
 > **Default tradeoff**: This branch defaults `OMLX_INKLING2_FP8_KV` to `"all"` (lossy unit-scale FP8 E4M3 KV cache across all attention layers) for long-context throughput and memory headroom. Set `OMLX_INKLING2_FP8_KV=0` for BF16 KV cache.
 
@@ -12,15 +12,17 @@ Every change sits in five files layered cleanly on top of `masterfasa/omlx@e1bff
 
 | File | Delta | Summary |
 | :--- | :---: | :--- |
-| [`omlx/patches/inkling2/kernels.py`](omlx/patches/inkling2/kernels.py) | `+1,534 / -6` | Exact FP32/BF16 vectorized router (`fast_router_logits`), fused `static_conv4_fused` + residual add, packed NVFP4/Affine-4 MoE for `L=1..2`, bit-exact pre-planned grouped-16 NVFP4 MoE for `L=3..16`, M5 Metal 4 `matmul2d` FlashAttention (`flash_banded_attention_nax`) and batched MoE prefill (`moe_prefill_nax`) |
+| [`omlx/patches/inkling2/kernels.py`](omlx/patches/inkling2/kernels.py) | `+1,731 / -6` | Exact FP32/BF16 vectorized router, fused conv+residual, zero-copy strided `fused_head_prep` and `fused_gated_output`, packed NVFP4/Affine-4 MoE (`L=1..2`), bit-exact grouped-16 NVFP4 MoE (`L=3..16`), M5 Metal 4 `matmul2d` FlashAttention and batched MoE prefill |
 | [`omlx/patches/inkling2/dspark.py`](omlx/patches/inkling2/dspark.py) | `+383 / -8` | Fused in-kernel 2-bit screened top-64 sampled DSpark head (`_DSPARK_HEAD_CANDS_SOURCE`), emitting `SparseDraftQ` + calibrated confidence with adaptive step slicing (`4` prose, up to `7` code/JSON) |
-| [`omlx/patches/inkling2/model.py`](omlx/patches/inkling2/model.py) | `+103 / -15` | Wires `fast_router_logits` (with bit-exact BF16 router cache), `moe_fused_packed`, `moe_prefill_nax` and fused conv+residual into `Inkling2Layer`/`Inkling2MoE`/`Inkling2Experts`, raises `_omlx_mtp_max_verify_rows = 16` and defaults `OMLX_INKLING2_FP8_KV` to `"all"` |
+| [`omlx/patches/inkling2/model.py`](omlx/patches/inkling2/model.py) | `+202 / -35` | Wires `fast_router_logits` (with bit-exact BF16 router cache), `_wide_linear` 8-bit prefill GEMMs, `fused_head_prep`, `fused_gated_output`, `moe_fused_packed`, `moe_prefill_nax` and fused conv+residual into `Inkling2Layer`/`Inkling2Attention`/`Inkling2MoE`, raises `_omlx_mtp_max_verify_rows = 16` and defaults `OMLX_INKLING2_FP8_KV` to `"all"` |
 | [`omlx/patches/mlx_lm_mtp/batch_generator.py`](omlx/patches/mlx_lm_mtp/batch_generator.py) | `+33 / -14` | Sparse top-512 nucleus verify (`allow_nucleus=True`) alongside `predraft` with clean fallback, vectorized `SparseDraftQ` scatter, `OMLX_MTP_DRAFT_POLICY="1"` default and preventing `_park_mtp_to_standard` from parking `DraftPolicy` sessions |
 | [`omlx/speculative/draft_policy.py`](omlx/speculative/draft_policy.py) | `+4 / -4` | Calibrates initial `_SHAPE` cost curve and `draft_ratio = 0.04` for M5 Pro fused MoE timings |
 
 ### 1. M5 Metal 4 `matmul2d` Prefill FlashAttention & Batched MoE (`kernels.py`, `model.py`)
 
 - **Banded-sink FlashAttention (`flash_banded_attention_nax`)**: Uses Metal 4 `mpp::tensor_ops::matmul2d` (`AQ=32, AK=64, D=128`, 8 simdgroups, 12 KB threadgroup memory) streaming BF16 K/V directly from device memory (dequantizing FP8 KV once per layer instead of per query tile), adding relative bias and per-head sinks in-kernel with zero dense mask allocation. For long full-attention contexts (`>4K` keys), swaps the dispatch grid so Metal's Y-sweep keeps one KV head resident in M5 Pro's 24–32 MB SLC across all query tiles (`3.3x` faster attention at 46.7K keys; `mean_diff = 0.000001`).
+- **Zero-copy strided head-prep & output gating (`fused_head_prep`, `fused_gated_output`)**: Reads `q`, `k`, `v`, `r` and `gate` directly from strided `mx.split` views with `ensure_row_contiguous=False`, fusing L2-clip (`q`, `k`, `r`), unit-RMS (`v`), optional `tau` scaling and head-major `[B, H, L, D]` layout into one kernel (`496 ms → 16 ms` across 48 visits at `T=2048`), and fusing `out * sigmoid(gate)` + token-major transpose into one kernel (`62.6 ms → 8.5 ms`).
+- **Bit-exact wide-M 8-bit prefill GEMMs (`_wide_linear`)**: For 8-bit affine attention projections at `M >= 1024`, dequantizes weights once and runs plain BF16 GEMM (`0.000000` max diff, `1.10–1.18x` faster on `in_proj`/`o_proj`).
 - **Batched MoE prefill (`moe_prefill_nax`)**: Uses GPU counting-sort routing (`_NAX_MOE_ROUTE_SOURCE`) and double-buffered 64×32 BF16 weight tiles fed to per-simdgroup `matmul2d(16, 64, 32)` with fused SiTU register epilogues for both NVFP4 (`group_size=16`) and Affine-4 (`group_size=64`) experts (`L >= 64`). Both Metal 4 paths run a one-time accumulator-layout probe (`can_use_nax_attn()` / `can_use_nax_moe()`) and fall back automatically on M1–M4 or older macOS.
 
 ### 2. Exact BF16/FP32 Router, Fused Conv+Residual & Grouped-16 NVFP4 MoE (`kernels.py`, `model.py`)
@@ -82,14 +84,14 @@ Sampled runs use `temp=1.0, top_p=0.95`; greedy runs use `temp=0`. Each prompt r
 
 ### Long-Context Prefill & Sampled Decode (`temp=1.0, top_p=0.95`, 512 Output Tokens)
 
-Measured head-to-head on identical 6.7K → 27.2K → 53.9K multi-turn prompts before and after adding the Metal 4 `matmul2d` FlashAttention (`flash_banded_attention_nax`), `matmul2d` MoE prefill (`moe_prefill_nax`), BF16 router and fused conv+residual kernels:
+Measured head-to-head on identical 6.7K → 27.2K → 53.9K multi-turn prompts before (`80b1b4d`) and after adding the Metal 4 `matmul2d` FlashAttention and MoE prefill, zero-copy `fused_head_prep`/`fused_gated_output`, `_wide_linear`, BF16 router and fused conv+residual kernels:
 
-| Turn / Context Length | Cached Prefix | Before (`80b1b4d`) Prefill / TTFT | After (`matmul2d` NAX) Prefill / TTFT | Prefill Gain | Decode Speed (After) |
+| Turn / Context Length | Cached Prefix | Before (`80b1b4d`) Prefill / TTFT | After Prefill / TTFT | Prefill Gain | Decode Speed (After) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| Turn 1 — 6,709 tokens (cold) | 0 | 953 tok/s (`7.23s`) | **1,206 tok/s (`5.71s`)** | **+26.6%** | **51.4 tok/s** |
-| Turn 2 — 27,179 tokens | 6,144 | 981 tok/s (`21.62s`) | **1,376 tok/s (`15.48s`)** | **+40.2%** | **47.9 tok/s** |
-| Turn 3 — 53,859 tokens | 26,624 | 681 tok/s (`40.19s`) | **1,103 tok/s (`24.91s`)** | **+62.0%** | **43.3 tok/s** |
-| Turn 3 warm retry — 53,859 tokens (2 seeds) | 53,858 | `0.25–0.71s` (`42.6–43.5 tok/s`) | **`0.26–0.63s`** | — | **46.1–46.8 tok/s** |
+| Turn 1 — 6,710 tokens (cold) | 0 | 953 tok/s (`7.23s`) | **1,415 tok/s (`4.93s`)** | **+48.5%** | **52.7 tok/s** |
+| Turn 2 — 27,180 tokens | 6,144 | 981 tok/s (`21.62s`) | **1,398 tok/s (`15.24s`)** | **+42.5%** | **47.4 tok/s** |
+| Turn 3 — 53,860 tokens | 26,624 | 681 tok/s (`40.19s`) | **1,120 tok/s (`24.49s`)** | **+64.5%** | **45.0 tok/s** |
+| Turn 3 warm retry — 53,860 tokens (2 seeds) | 53,859 | `0.25–0.71s` (`42.6–43.5 tok/s`) | **`0.25–0.66s`** | — | **46.3–46.3 tok/s** |
 
 *(Earlier `80b1b4d` multi-turn measurements on a separate 5.8K → 23.5K → 46.7K prompt suite for the `mlx-serve` comparison below: 977 / 977 / 753 tok/s prefill and 55.4 / 51.4 / 47.7 tok/s decode, with 43.8–45.3 tok/s and 0.32–0.65s TTFT on warm 46.7K retries.)*
 
@@ -167,3 +169,4 @@ curl -s http://127.0.0.1:8000/v1/models
 - **[`ddalcu/mlx-serve`](https://github.com/ddalcu/mlx-serve)** — Metal kernel design inspiration for `fast_router_logits` and `L=1..2` packed NVFP4/Affine-4 MoE.
 - **[`ShinMegamiBoson/lookatmyquant`](https://github.com/ShinMegamiBoson/lookatmyquant)** — pre-planned expert-grouping design inspiration for shared MoE experts across `L=3..16`.
 - **[`Eriskii/erisinky`](https://github.com/Eriskii/erisinky)** — Metal 4 `mpp::tensor_ops::matmul2d` FlashAttention (`k_attn_h`), per-simdgroup `matmul2d` MoE prefill (`k_moe_sg`), Y-axis cache-locality dispatch order, bit-exact BF16 router weights and fused post-conv+residual epilogues.
+- **[`ARahim3/mlx-dspark`](https://github.com/ARahim3/mlx-dspark)** — fused Inkling 2 attention head-prep (`inkling_fused.py`), fused output gating and bit-exact wide-M 8-bit prefill GEMMs (`wide_gemm.py`).
