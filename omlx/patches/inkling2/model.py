@@ -88,7 +88,7 @@ class TextArgs:
         if "conv_kernel_size" in params:
             args.sconv_kernel_size = int(params["conv_kernel_size"])
         if "fp8_kv" not in params:
-            env = os.environ.get("OMLX_INKLING2_FP8_KV", "all").strip().lower()
+            env = os.environ.get("OMLX_INKLING2_FP8_KV", "0").strip().lower()
             if env in ("1", "true", "yes", "all"):
                 args.fp8_kv = "all"
             elif env == "full":
