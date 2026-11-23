@@ -1227,6 +1227,15 @@ def banded_sink_attention(
         _use_flash(length, window)
         or (fp8_kv and length >= _FLASH_MIN_QUERIES and mx.default_device() == mx.gpu)
     ):
+        if (
+            d == 128
+            and k.dtype in (mx.bfloat16, mx.uint8)
+            and hq % k.shape[1] == 0
+            and can_use_nax_attn()
+        ):
+            return flash_banded_attention_nax(
+                q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
+            )
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )
@@ -1714,8 +1723,12 @@ _STATIC_CONV4_SOURCE = """
     float x3 = float(xb[(size_t)l * C + c]);
     float conv = float(wp[0]) * x0 + float(wp[1]) * x1
         + float(wp[2]) * x2 + float(wp[3]) * x3;
-    float y = (float(WT(conv)) + x3) * scale[0];
-    out[idx] = T(y);
+    float y = float(T((float(WT(conv)) + x3) * scale[0]));
+    if (HAS_RES) {
+        out[idx] = OT(float(res[idx]) + y);
+    } else {
+        out[idx] = OT(y);
+    }
     if (L >= 3) {
         if (l >= L - 3) {
             next_state[((size_t)b * 3 + (l - (L - 3))) * C + c] = x3;
@@ -1820,22 +1833,30 @@ def static_conv4_fused(
     w: mx.array,
     state: mx.array,
     scale: mx.array,
+    residual: mx.array | None = None,
+    out_dtype=None,
 ) -> tuple[mx.array, mx.array]:
-    """Fused K=4 depthwise causal conv, residual add, scale, and next state."""
+    """Fused K=4 depthwise causal conv, scale, optional residual add and next state."""
     global _static_conv4_kernel
     if _static_conv4_kernel is None:
         _static_conv4_kernel = mx.fast.metal_kernel(
             name="omlx_inkling2_static_conv4",
-            input_names=["x", "w", "state", "scale"],
+            input_names=["x", "w", "state", "scale", "res"],
             output_names=["out", "next_state"],
             source=_STATIC_CONV4_SOURCE,
         )
     b, length, channels = x.shape
+    has_res = 1 if residual is not None else 0
+    res_arr = residual if has_res else _dummy_f32()
+    odtype = x.dtype if out_dtype is None else out_dtype
     out, next_state = _static_conv4_kernel(
-        inputs=[x, w, state.astype(mx.float32), scale],
+        inputs=[x, w, state.astype(mx.float32), scale, res_arr],
         template=[
             ("T", x.dtype),
             ("WT", w.dtype),
+            ("RT", res_arr.dtype),
+            ("OT", odtype),
+            ("HAS_RES", has_res),
             ("B", b),
             ("L", length),
             ("C", channels),
@@ -1843,7 +1864,7 @@ def static_conv4_fused(
         grid=(b * length * channels, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(b, length, channels), (b, 3, channels)],
-        output_dtypes=[x.dtype, mx.float32],
+        output_dtypes=[odtype, mx.float32],
     )
     return out, next_state
 
@@ -1857,12 +1878,13 @@ _FAST_ROUTER_SOURCE = r"""
     const uint e = thread_position_in_grid.y;
     const uint s = thread_position_in_grid.z;
     const device T* x = X + size_t(s) * D;
-    const device float* w = RT + size_t(e) * D;
+    const device RT_T* w = RT + size_t(e) * D;
     float acc = 0.0f;
     for (uint i = lane * 4u; i < D; i += 128u) {
-        float4 w4 = *(const device float4*)(w + i);
-        acc += float(x[i]) * w4.x + float(x[i + 1u]) * w4.y
-             + float(x[i + 2u]) * w4.z + float(x[i + 3u]) * w4.w;
+        acc += float(x[i]) * float(w[i])
+             + float(x[i + 1u]) * float(w[i + 1u])
+             + float(x[i + 2u]) * float(w[i + 2u])
+             + float(x[i + 3u]) * float(w[i + 3u]);
     }
     acc = simd_sum(acc);
     if (lane == 0u) SC[size_t(s) * E + e] = acc;
@@ -2261,7 +2283,7 @@ _moe_comb_kernel = None
 
 
 def fast_router_logits(x: mx.array, router_weight: mx.array) -> mx.array:
-    """Exact FP32 router dot product for small batches (avoids M5 NAX slow TF32 path)."""
+    """Exact FP32 router dot product for small batches (supports FP32 or bit-exact BF16 weights)."""
     global _fast_router_kernel
     if _fast_router_kernel is None:
         _fast_router_kernel = mx.fast.metal_kernel(
@@ -2274,7 +2296,12 @@ def fast_router_logits(x: mx.array, router_weight: mx.array) -> mx.array:
     experts = router_weight.shape[0]
     return _fast_router_kernel(
         inputs=[x, router_weight],
-        template=[("T", x.dtype), ("D", hidden), ("E", experts)],
+        template=[
+            ("T", x.dtype),
+            ("RT_T", router_weight.dtype),
+            ("D", hidden),
+            ("E", experts),
+        ],
         grid=(32, experts, rows),
         threadgroup=(32, 4, 1),
         output_shapes=[(rows, experts)],
@@ -2436,3 +2463,914 @@ def moe_fused_packed(
         output_shapes=[(rows, hidden)],
         output_dtypes=[x.dtype],
     )[0]
+
+
+# ---------------------------------------------------------------------------
+# M5 Neural Accelerator (Metal 4 matmul2d) batched MoE prefill (NVFP4 & Aff4)
+# ---------------------------------------------------------------------------
+
+_NAX_MOE_HEADER = r"""
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+
+constant float _INK2_E2M1_F[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+inline float _ink2_e4m3_scale_f(uchar b) {
+    return float(as_type<half>(ushort(((uint(b) & 0x7Fu) << 7) | ((uint(b) & 0x80u) << 8)))) * 256.0f;
+}
+
+inline void _ink2_stage_nvfp4_16_bf(
+    const device uint* wrow,
+    const device uchar* srow,
+    uint c,
+    thread bfloat4* out
+) {
+    const uint2 pk = ((const device uint2*)wrow)[c];
+    const float sc = _ink2_e4m3_scale_f(srow[c]);
+    const uint w0 = pk.x, w1 = pk.y;
+    out[0] = bfloat4(float4(_INK2_E2M1_F[w0 & 15u], _INK2_E2M1_F[(w0 >> 4) & 15u],
+                            _INK2_E2M1_F[(w0 >> 8) & 15u], _INK2_E2M1_F[(w0 >> 12) & 15u]) * sc);
+    out[1] = bfloat4(float4(_INK2_E2M1_F[(w0 >> 16) & 15u], _INK2_E2M1_F[(w0 >> 20) & 15u],
+                            _INK2_E2M1_F[(w0 >> 24) & 15u], _INK2_E2M1_F[(w0 >> 28) & 15u]) * sc);
+    out[2] = bfloat4(float4(_INK2_E2M1_F[w1 & 15u], _INK2_E2M1_F[(w1 >> 4) & 15u],
+                            _INK2_E2M1_F[(w1 >> 8) & 15u], _INK2_E2M1_F[(w1 >> 12) & 15u]) * sc);
+    out[3] = bfloat4(float4(_INK2_E2M1_F[(w1 >> 16) & 15u], _INK2_E2M1_F[(w1 >> 20) & 15u],
+                            _INK2_E2M1_F[(w1 >> 24) & 15u], _INK2_E2M1_F[(w1 >> 28) & 15u]) * sc);
+}
+
+template <typename S, int GS>
+inline void _ink2_stage_aff4_16_bf(
+    const device uint* wrow,
+    const device S* srow,
+    const device S* brow,
+    uint c,
+    thread bfloat4* out
+) {
+    const uint2 pk = ((const device uint2*)wrow)[c];
+    const uint g = (c * 16u) / GS;
+    const float sc = float(srow[g]);
+    const float bi = float(brow[g]);
+    const uint w0 = pk.x, w1 = pk.y;
+    out[0] = bfloat4(fma(float4(w0 & 15u, (w0 >> 4) & 15u, (w0 >> 8) & 15u, (w0 >> 12) & 15u), sc, bi));
+    out[1] = bfloat4(fma(float4((w0 >> 16) & 15u, (w0 >> 20) & 15u, (w0 >> 24) & 15u, (w0 >> 28) & 15u), sc, bi));
+    out[2] = bfloat4(fma(float4(w1 & 15u, (w1 >> 4) & 15u, (w1 >> 8) & 15u, (w1 >> 12) & 15u), sc, bi));
+    out[3] = bfloat4(fma(float4((w1 >> 16) & 15u, (w1 >> 20) & 15u, (w1 >> 24) & 15u, (w1 >> 28) & 15u), sc, bi));
+}
+"""
+
+_NAX_MOE_LAYOUT_PROBE_SOURCE = r"""
+    threadgroup bfloat sa[64 * 32];
+    auto tA = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(32, 64));
+    auto tX = tensor((device bfloat*)X, dextents<int32_t, 2>(32, 16), array<int, 2>({1, 32}));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(16, 64, 32, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tA), float>();
+    uint tid = thread_index_in_threadgroup;
+    for (short i = 0; i < cT.get_capacity() && i < 63; ++i) {
+        if (cT.is_valid_element(i)) {
+            auto ix = cT.get_multidimensional_index(i);
+            OUT[tid * 64 + i] = int((ix[0] << 16) | ix[1]);
+        } else {
+            OUT[tid * 64 + i] = -1;
+        }
+    }
+    OUT[tid * 64 + 63] = int(cT.get_capacity());
+"""
+
+_NAX_MOE_ROUTE_SOURCE = r"""
+    threadgroup atomic_uint cnt[NEXP];
+    threadgroup uint off[NEXP], toff[NEXP];
+    threadgroup atomic_uint fill[NEXP];
+    const uint tid = thread_index_in_threadgroup;
+    if (tid < NEXP) {
+        atomic_store_explicit(&cnt[tid], 0u, memory_order_relaxed);
+        atomic_store_explicit(&fill[tid], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n = T_TOK * TOPK;
+    for (uint i = tid; i < n; i += 256u) {
+        atomic_fetch_add_explicit(&cnt[INDS[i]], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint s = 0u, ts = 0u;
+        for (uint e = 0u; e < NEXP; ++e) {
+            uint c = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+            off[e] = s;
+            toff[e] = ts;
+            s += c;
+            ts += (c + TILE_SZ - 1u) / TILE_SZ;
+        }
+        NTILES[0] = ts;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n; i += 256u) {
+        uint e = INDS[i];
+        uint slot = off[e] + atomic_fetch_add_explicit(&fill[e], 1u, memory_order_relaxed);
+        PERM[slot] = i / TOPK;
+        INV[i] = slot;
+        AW[slot] = WTS[i];
+    }
+    if (tid < NEXP) {
+        uint c = atomic_load_explicit(&cnt[tid], memory_order_relaxed);
+        uint nt = (c + TILE_SZ - 1u) / TILE_SZ;
+        for (uint j = 0u; j < nt; ++j) {
+            uint base = (toff[tid] + j) * 4u;
+            TILES[base + 0u] = tid;
+            TILES[base + 1u] = off[tid] + j * TILE_SZ;
+            TILES[base + 2u] = min(uint(TILE_SZ), c - j * TILE_SZ);
+            TILES[base + 3u] = 0u;
+        }
+    }
+"""
+
+_NAX_MOE_GATHER_SOURCE = r"""
+    const uint slot = threadgroup_position_in_grid.x;
+    const uint tok = PERM[slot];
+    const uint tid = thread_index_in_threadgroup;
+    const device bfloat4* src = (const device bfloat4*)(X + size_t(tok) * D);
+    device bfloat4* dst = (device bfloat4*)(XG + size_t(slot) * D);
+    for (uint i = tid; i < (D >> 2); i += 128u) {
+        dst[i] = src[i];
+    }
+"""
+
+_NAX_MOE_UP_NVFP4_SOURCE = r"""
+    const uint tile_idx = threadgroup_position_in_grid.x;
+    const uint cb = threadgroup_position_in_grid.y;
+    if (tile_idx >= NTILES[0]) return;
+    const uint tid = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint e = TILES[tile_idx * 4u + 0u];
+    const uint as0 = TILES[tile_idx * 4u + 1u];
+    const uint cnt = TILES[tile_idx * 4u + 2u];
+    const uint ts0 = sg * 16u;
+    const bool on = ts0 < cnt;
+    const int nt = on ? min(16, int(cnt - ts0)) : 0;
+
+    threadgroup bfloat sa[2][64 * 32];
+    auto tA0 = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa[0], dextents<int32_t, 2>(32, 64));
+    auto tA1 = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa[1], dextents<int32_t, 2>(32, 64));
+    auto tX = tensor((device bfloat*)(XG + size_t(as0 + (on ? ts0 : 0u)) * K_DIM), dextents<int32_t, 2>(K_DIM, nt), array<int, 2>({1, K_DIM}));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(16, 64, 32, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tA0), float>();
+
+    const bool wact = tid < 128u;
+    const uint rr = tid >> 1;
+    const uint hp = tid & 1u;
+    const uint wrow = (rr < 32u) ? (2u * (cb * 32u + rr)) : (2u * (cb * 32u + (rr - 32u)) + 1u);
+    const device uint* wp = W + (size_t(e) * (2u * FF_DIM) + wrow) * (K_DIM >> 3);
+    const device uchar* sp = S + (size_t(e) * (2u * FF_DIM) + wrow) * (K_DIM >> 4);
+
+    bfloat4 wv[4];
+    if (wact) {
+        _ink2_stage_nvfp4_16_bf(wp, sp, hp, wv);
+        threadgroup bfloat4* dst = (threadgroup bfloat4*)(sa[0] + rr * 32u + hp * 16u);
+        dst[0] = wv[0]; dst[1] = wv[1]; dst[2] = wv[2]; dst[3] = wv[3];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint buf = 0u;
+    for (uint k0 = 0u; k0 < K_DIM; k0 += 32u) {
+        const bool more = (k0 + 32u) < K_DIM;
+        if (more && wact) _ink2_stage_nvfp4_16_bf(wp, sp, ((k0 + 32u) >> 4) + hp, wv);
+        if (on) {
+            auto sx = tX.slice(int(k0), 0);
+            if (buf == 0u) mm.run(sx, tA0, cT); else mm.run(sx, tA1, cT);
+        }
+        if (more && wact) {
+            threadgroup bfloat4* dst = (threadgroup bfloat4*)(sa[buf ^ 1u] + rr * 32u + hp * 16u);
+            dst[0] = wv[0]; dst[1] = wv[1]; dst[2] = wv[2]; dst[3] = wv[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        buf ^= 1u;
+    }
+    if (!on) return;
+    const float gsc = GS_ARR[e] * PR[4];
+    const float inv_gcap = PR[0], gcap = PR[1], inv_ucap = PR[2], ucap = PR[3];
+    for (short q = 0; q < 4; ++q) {
+        const auto ix = cT.get_multidimensional_index(4 * q);
+        const uint r = ix[0], t = ts0 + ix[1];
+        if (t < cnt) {
+            const float4 gt = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]) * gsc;
+            const float4 up = float4(cT[4 * q + 16], cT[4 * q + 17], cT[4 * q + 18], cT[4 * q + 19]) * gsc;
+            const float4 sg_v = gcap * tanh(gt * inv_gcap) / (1.0f + exp(-gt));
+            const float4 su_v = ucap * tanh(up * inv_ucap);
+            *(device bfloat4*)(ACT + size_t(as0 + t) * FF_DIM + cb * 32u + r) = bfloat4(sg_v * su_v);
+        }
+    }
+"""
+
+_NAX_MOE_DN_NVFP4_SOURCE = r"""
+    const uint tile_idx = threadgroup_position_in_grid.x;
+    const uint cb = threadgroup_position_in_grid.y;
+    if (tile_idx >= NTILES[0]) return;
+    const uint tid = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint e = TILES[tile_idx * 4u + 0u];
+    const uint as0 = TILES[tile_idx * 4u + 1u];
+    const uint cnt = TILES[tile_idx * 4u + 2u];
+    const uint ts0 = sg * 16u;
+    const bool on = ts0 < cnt;
+    const int nt = on ? min(16, int(cnt - ts0)) : 0;
+
+    threadgroup bfloat sa[2][64 * 32];
+    auto tA0 = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa[0], dextents<int32_t, 2>(32, 64));
+    auto tA1 = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa[1], dextents<int32_t, 2>(32, 64));
+    auto tX = tensor((device bfloat*)(ACT + size_t(as0 + (on ? ts0 : 0u)) * K_DIM), dextents<int32_t, 2>(K_DIM, nt), array<int, 2>({1, K_DIM}));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(16, 64, 32, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tA0), float>();
+
+    const bool wact = tid < 128u;
+    const uint rr = tid >> 1;
+    const uint hp = tid & 1u;
+    const uint wrow = cb * 64u + rr;
+    const device uint* wp = W + (size_t(e) * OUT_DIM + wrow) * (K_DIM >> 3);
+    const device uchar* sp = S + (size_t(e) * OUT_DIM + wrow) * (K_DIM >> 4);
+
+    bfloat4 wv[4];
+    if (wact) {
+        _ink2_stage_nvfp4_16_bf(wp, sp, hp, wv);
+        threadgroup bfloat4* dst = (threadgroup bfloat4*)(sa[0] + rr * 32u + hp * 16u);
+        dst[0] = wv[0]; dst[1] = wv[1]; dst[2] = wv[2]; dst[3] = wv[3];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint buf = 0u;
+    for (uint k0 = 0u; k0 < K_DIM; k0 += 32u) {
+        const bool more = (k0 + 32u) < K_DIM;
+        if (more && wact) _ink2_stage_nvfp4_16_bf(wp, sp, ((k0 + 32u) >> 4) + hp, wv);
+        if (on) {
+            auto sx = tX.slice(int(k0), 0);
+            if (buf == 0u) mm.run(sx, tA0, cT); else mm.run(sx, tA1, cT);
+        }
+        if (more && wact) {
+            threadgroup bfloat4* dst = (threadgroup bfloat4*)(sa[buf ^ 1u] + rr * 32u + hp * 16u);
+            dst[0] = wv[0]; dst[1] = wv[1]; dst[2] = wv[2]; dst[3] = wv[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        buf ^= 1u;
+    }
+    if (!on) return;
+    const float gsc = GS_ARR[e] * INV_SC[0];
+    for (short q = 0; q < 8; ++q) {
+        const auto ix = cT.get_multidimensional_index(4 * q);
+        const uint r = ix[0], t = ts0 + ix[1];
+        if (t < cnt) {
+            const float4 v = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]) * gsc;
+            *(device bfloat4*)(YD + size_t(as0 + t) * OUT_DIM + cb * 64u + r) = bfloat4(v);
+        }
+    }
+"""
+
+_NAX_MOE_UP_AFF4_SOURCE = r"""
+    const uint tile_idx = threadgroup_position_in_grid.x;
+    const uint cb = threadgroup_position_in_grid.y;
+    if (tile_idx >= NTILES[0]) return;
+    const uint tid = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint e = TILES[tile_idx * 4u + 0u];
+    const uint as0 = TILES[tile_idx * 4u + 1u];
+    const uint cnt = TILES[tile_idx * 4u + 2u];
+    const uint ts0 = sg * 16u;
+    const bool on = ts0 < cnt;
+    const int nt = on ? min(16, int(cnt - ts0)) : 0;
+
+    threadgroup bfloat sa[2][64 * 32];
+    auto tA0 = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa[0], dextents<int32_t, 2>(32, 64));
+    auto tA1 = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa[1], dextents<int32_t, 2>(32, 64));
+    auto tX = tensor((device bfloat*)(XG + size_t(as0 + (on ? ts0 : 0u)) * K_DIM), dextents<int32_t, 2>(K_DIM, nt), array<int, 2>({1, K_DIM}));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(16, 64, 32, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tA0), float>();
+
+    const bool wact = tid < 128u;
+    const uint rr = tid >> 1;
+    const uint hp = tid & 1u;
+    const uint wrow = (rr < 32u) ? (2u * (cb * 32u + rr)) : (2u * (cb * 32u + (rr - 32u)) + 1u);
+    const device uint* wp = W + (size_t(e) * (2u * FF_DIM) + wrow) * (K_DIM >> 3);
+    const device S_T* sp = S + (size_t(e) * (2u * FF_DIM) + wrow) * (K_DIM / GS);
+    const device S_T* bp = B + (size_t(e) * (2u * FF_DIM) + wrow) * (K_DIM / GS);
+
+    bfloat4 wv[4];
+    if (wact) {
+        _ink2_stage_aff4_16_bf<S_T, GS>(wp, sp, bp, hp, wv);
+        threadgroup bfloat4* dst = (threadgroup bfloat4*)(sa[0] + rr * 32u + hp * 16u);
+        dst[0] = wv[0]; dst[1] = wv[1]; dst[2] = wv[2]; dst[3] = wv[3];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint buf = 0u;
+    for (uint k0 = 0u; k0 < K_DIM; k0 += 32u) {
+        const bool more = (k0 + 32u) < K_DIM;
+        if (more && wact) _ink2_stage_aff4_16_bf<S_T, GS>(wp, sp, bp, ((k0 + 32u) >> 4) + hp, wv);
+        if (on) {
+            auto sx = tX.slice(int(k0), 0);
+            if (buf == 0u) mm.run(sx, tA0, cT); else mm.run(sx, tA1, cT);
+        }
+        if (more && wact) {
+            threadgroup bfloat4* dst = (threadgroup bfloat4*)(sa[buf ^ 1u] + rr * 32u + hp * 16u);
+            dst[0] = wv[0]; dst[1] = wv[1]; dst[2] = wv[2]; dst[3] = wv[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        buf ^= 1u;
+    }
+    if (!on) return;
+    const float inv_gcap = PR[0], gcap = PR[1], inv_ucap = PR[2], ucap = PR[3];
+    for (short q = 0; q < 4; ++q) {
+        const auto ix = cT.get_multidimensional_index(4 * q);
+        const uint r = ix[0], t = ts0 + ix[1];
+        if (t < cnt) {
+            const float4 gt = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]);
+            const float4 up = float4(cT[4 * q + 16], cT[4 * q + 17], cT[4 * q + 18], cT[4 * q + 19]);
+            const float4 sg_v = gcap * tanh(gt * inv_gcap) / (1.0f + exp(-gt));
+            const float4 su_v = ucap * tanh(up * inv_ucap);
+            *(device bfloat4*)(ACT + size_t(as0 + t) * FF_DIM + cb * 32u + r) = bfloat4(sg_v * su_v);
+        }
+    }
+"""
+
+_NAX_MOE_DN_AFF4_SOURCE = r"""
+    const uint tile_idx = threadgroup_position_in_grid.x;
+    const uint cb = threadgroup_position_in_grid.y;
+    if (tile_idx >= NTILES[0]) return;
+    const uint tid = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint e = TILES[tile_idx * 4u + 0u];
+    const uint as0 = TILES[tile_idx * 4u + 1u];
+    const uint cnt = TILES[tile_idx * 4u + 2u];
+    const uint ts0 = sg * 16u;
+    const bool on = ts0 < cnt;
+    const int nt = on ? min(16, int(cnt - ts0)) : 0;
+
+    threadgroup bfloat sa[2][64 * 32];
+    auto tA0 = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa[0], dextents<int32_t, 2>(32, 64));
+    auto tA1 = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sa[1], dextents<int32_t, 2>(32, 64));
+    auto tX = tensor((device bfloat*)(ACT + size_t(as0 + (on ? ts0 : 0u)) * K_DIM), dextents<int32_t, 2>(K_DIM, nt), array<int, 2>({1, K_DIM}));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(16, 64, 32, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tA0), float>();
+
+    const bool wact = tid < 128u;
+    const uint rr = tid >> 1;
+    const uint hp = tid & 1u;
+    const uint wrow = cb * 64u + rr;
+    const device uint* wp = W + (size_t(e) * OUT_DIM + wrow) * (K_DIM >> 3);
+    const device S_T* sp = S + (size_t(e) * OUT_DIM + wrow) * (K_DIM / GS);
+    const device S_T* bp = B + (size_t(e) * OUT_DIM + wrow) * (K_DIM / GS);
+
+    bfloat4 wv[4];
+    if (wact) {
+        _ink2_stage_aff4_16_bf<S_T, GS>(wp, sp, bp, hp, wv);
+        threadgroup bfloat4* dst = (threadgroup bfloat4*)(sa[0] + rr * 32u + hp * 16u);
+        dst[0] = wv[0]; dst[1] = wv[1]; dst[2] = wv[2]; dst[3] = wv[3];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint buf = 0u;
+    for (uint k0 = 0u; k0 < K_DIM; k0 += 32u) {
+        const bool more = (k0 + 32u) < K_DIM;
+        if (more && wact) _ink2_stage_aff4_16_bf<S_T, GS>(wp, sp, bp, ((k0 + 32u) >> 4) + hp, wv);
+        if (on) {
+            auto sx = tX.slice(int(k0), 0);
+            if (buf == 0u) mm.run(sx, tA0, cT); else mm.run(sx, tA1, cT);
+        }
+        if (more && wact) {
+            threadgroup bfloat4* dst = (threadgroup bfloat4*)(sa[buf ^ 1u] + rr * 32u + hp * 16u);
+            dst[0] = wv[0]; dst[1] = wv[1]; dst[2] = wv[2]; dst[3] = wv[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        buf ^= 1u;
+    }
+    if (!on) return;
+    for (short q = 0; q < 8; ++q) {
+        const auto ix = cT.get_multidimensional_index(4 * q);
+        const uint r = ix[0], t = ts0 + ix[1];
+        if (t < cnt) {
+            const float4 v = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]);
+            *(device bfloat4*)(YD + size_t(as0 + t) * OUT_DIM + cb * 64u + r) = bfloat4(v);
+        }
+    }
+"""
+
+_NAX_MOE_COMB_SOURCE = r"""
+    const uint tok = threadgroup_position_in_grid.x;
+    const uint tid = thread_index_in_threadgroup;
+    uint slots[TOPK];
+    float ws[TOPK];
+    for (uint k = 0u; k < TOPK; ++k) {
+        uint s = INV[tok * TOPK + k];
+        slots[k] = s;
+        ws[k] = AW[s];
+    }
+    device bfloat4* dst = (device bfloat4*)(OUT + size_t(tok) * D);
+    for (uint i = tid; i < (D >> 2); i += 128u) {
+        float4 acc = float4(0.0f);
+        for (uint k = 0u; k < TOPK; ++k) {
+            acc += ws[k] * float4(((const device bfloat4*)(YD + size_t(slots[k]) * D))[i]);
+        }
+        dst[i] = bfloat4(acc);
+    }
+"""
+
+_nax_moe_supported: bool | None = None
+_nax_moe_route_kernel = None
+_nax_moe_gather_kernel = None
+_nax_moe_up_nvfp4_kernel = None
+_nax_moe_dn_nvfp4_kernel = None
+_nax_moe_up_aff4_kernel = None
+_nax_moe_dn_aff4_kernel = None
+_nax_moe_comb_kernel = None
+
+
+def can_use_nax_moe() -> bool:
+    """Return True if Metal 4 matmul2d is available and matches the expected quad layout."""
+    global _nax_moe_supported
+    if _nax_moe_supported is not None:
+        return _nax_moe_supported
+    if not is_nax_available() or mx.default_device() != mx.gpu:
+        _nax_moe_supported = False
+        return False
+    try:
+        probe = mx.fast.metal_kernel(
+            name="omlx_inkling2_nax_moe_probe",
+            input_names=["X"],
+            output_names=["OUT"],
+            header=_NAX_MOE_HEADER,
+            source=_NAX_MOE_LAYOUT_PROBE_SOURCE,
+        )
+        out = probe(
+            inputs=[mx.zeros((16, 32), dtype=mx.bfloat16)],
+            output_shapes=[(32 * 64,)],
+            output_dtypes=[mx.int32],
+            grid=(32, 1, 1),
+            threadgroup=(32, 1, 1),
+        )[0]
+        mx.eval(out)
+        arr = out.tolist()
+        ok = arr[63] == 32
+        if ok:
+            for lane in range(32):
+                base = lane * 64
+                for q in range(4):
+                    r0_base = arr[base + 4 * q] >> 16
+                    t0_base = arr[base + 4 * q] & 0xFFFF
+                    for j in range(4):
+                        v0 = arr[base + 4 * q + j]
+                        v1 = arr[base + 4 * q + 16 + j]
+                        if (
+                            (v0 >> 16) != r0_base + j
+                            or (v0 & 0xFFFF) != t0_base
+                            or (v1 >> 16) != r0_base + 32 + j
+                            or (v1 & 0xFFFF) != t0_base
+                        ):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+        _nax_moe_supported = ok
+    except Exception:
+        _nax_moe_supported = False
+    return _nax_moe_supported
+
+
+def moe_prefill_nax(
+    x: mx.array,
+    w13,
+    w2,
+    inds: mx.array,
+    weights: mx.array,
+    up_params: mx.array,
+    dn_params: mx.array,
+) -> mx.array:
+    """M5 Metal 4 matmul2d batched MoE prefill for NVFP4 and Affine-4 experts."""
+    global _nax_moe_route_kernel, _nax_moe_gather_kernel, _nax_moe_comb_kernel
+    global _nax_moe_up_nvfp4_kernel, _nax_moe_dn_nvfp4_kernel
+    global _nax_moe_up_aff4_kernel, _nax_moe_dn_aff4_kernel
+    rows, hidden = x.shape
+    top_k = inds.shape[1]
+    experts = w13.weight.shape[0]
+    inter = w13.weight.shape[1] // 2
+    nsg = 4 if rows < 1024 else 8
+    tile_sz = nsg * 16
+    max_tiles = (rows * top_k) // tile_sz + experts
+
+    if _nax_moe_route_kernel is None:
+        _nax_moe_route_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_nax_moe_route",
+            input_names=["INDS", "WTS"],
+            output_names=["PERM", "INV", "AW", "TILES", "NTILES"],
+            source=_NAX_MOE_ROUTE_SOURCE,
+        )
+        _nax_moe_gather_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_nax_moe_gather",
+            input_names=["X", "PERM"],
+            output_names=["XG"],
+            source=_NAX_MOE_GATHER_SOURCE,
+        )
+        _nax_moe_comb_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_nax_moe_comb",
+            input_names=["YD", "INV", "AW"],
+            output_names=["OUT"],
+            source=_NAX_MOE_COMB_SOURCE,
+        )
+
+    perm, inv, aw, tiles, ntiles = _nax_moe_route_kernel(
+        inputs=[inds.reshape(-1).astype(mx.uint32), weights.reshape(-1).astype(mx.float32)],
+        template=[("NEXP", experts), ("TOPK", top_k), ("T_TOK", rows), ("TILE_SZ", tile_sz)],
+        grid=(256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[
+            (rows * top_k,),
+            (rows * top_k,),
+            (rows * top_k,),
+            (max_tiles * 4,),
+            (1,),
+        ],
+        output_dtypes=[mx.uint32, mx.uint32, mx.float32, mx.uint32, mx.uint32],
+    )
+    xg = _nax_moe_gather_kernel(
+        inputs=[x, perm],
+        template=[("D", hidden)],
+        grid=(rows * top_k * 128, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows * top_k, hidden)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+    if w13.mode == "nvfp4":
+        if _nax_moe_up_nvfp4_kernel is None:
+            _nax_moe_up_nvfp4_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_nax_moe_up_nvfp4",
+                input_names=["XG", "W", "S", "GS_ARR", "TILES", "NTILES", "PR"],
+                output_names=["ACT"],
+                header=_NAX_MOE_HEADER,
+                source=_NAX_MOE_UP_NVFP4_SOURCE,
+            )
+            _nax_moe_dn_nvfp4_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_nax_moe_dn_nvfp4",
+                input_names=["ACT", "W", "S", "GS_ARR", "TILES", "NTILES", "INV_SC"],
+                output_names=["YD"],
+                header=_NAX_MOE_HEADER,
+                source=_NAX_MOE_DN_NVFP4_SOURCE,
+            )
+        act = _nax_moe_up_nvfp4_kernel(
+            inputs=[xg, w13.weight, w13.scales, w13.global_scale, tiles, ntiles, up_params],
+            template=[("K_DIM", hidden), ("FF_DIM", inter)],
+            grid=(max_tiles * nsg * 32, inter // 32, 1),
+            threadgroup=(nsg * 32, 1, 1),
+            output_shapes=[(rows * top_k, inter)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+        yd = _nax_moe_dn_nvfp4_kernel(
+            inputs=[act, w2.weight, w2.scales, w2.global_scale, tiles, ntiles, dn_params],
+            template=[("K_DIM", inter), ("OUT_DIM", hidden)],
+            grid=(max_tiles * nsg * 32, hidden // 64, 1),
+            threadgroup=(nsg * 32, 1, 1),
+            output_shapes=[(rows * top_k, hidden)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+    else:
+        if _nax_moe_up_aff4_kernel is None:
+            _nax_moe_up_aff4_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_nax_moe_up_aff4",
+                input_names=["XG", "W", "S", "B", "TILES", "NTILES", "PR"],
+                output_names=["ACT"],
+                header=_NAX_MOE_HEADER,
+                source=_NAX_MOE_UP_AFF4_SOURCE,
+            )
+            _nax_moe_dn_aff4_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_nax_moe_dn_aff4",
+                input_names=["ACT", "W", "S", "B", "TILES", "NTILES"],
+                output_names=["YD"],
+                header=_NAX_MOE_HEADER,
+                source=_NAX_MOE_DN_AFF4_SOURCE,
+            )
+        act = _nax_moe_up_aff4_kernel(
+            inputs=[xg, w13.weight, w13.scales, w13.biases, tiles, ntiles, up_params],
+            template=[
+                ("S_T", w13.scales.dtype),
+                ("GS", w13.group_size),
+                ("K_DIM", hidden),
+                ("FF_DIM", inter),
+            ],
+            grid=(max_tiles * nsg * 32, inter // 32, 1),
+            threadgroup=(nsg * 32, 1, 1),
+            output_shapes=[(rows * top_k, inter)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+        yd = _nax_moe_dn_aff4_kernel(
+            inputs=[act, w2.weight, w2.scales, w2.biases, tiles, ntiles],
+            template=[
+                ("S_T", w2.scales.dtype),
+                ("GS", w2.group_size),
+                ("K_DIM", inter),
+                ("OUT_DIM", hidden),
+            ],
+            grid=(max_tiles * nsg * 32, hidden // 64, 1),
+            threadgroup=(nsg * 32, 1, 1),
+            output_shapes=[(rows * top_k, hidden)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+
+    return _nax_moe_comb_kernel(
+        inputs=[yd, inv, aw],
+        template=[("D", hidden), ("TOPK", top_k)],
+        grid=(rows * 128, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
+# ---------------------------------------------------------------------------
+# M5 Neural Accelerator (Metal 4 matmul2d) FlashAttention with rel-bias + sink
+# ---------------------------------------------------------------------------
+
+_NAX_ATTN_PROBE_SOURCE = r"""
+    threadgroup bfloat sp[32 * 64];
+    auto tp = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sp, dextents<int32_t, 2>(64, 32));
+    auto tv0 = tensor((device bfloat*)V, dextents<int32_t, 2>(128, 64), array<int, 2>({1, 128}));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(32, 128, 64, false, false, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<8>> mm_pv;
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+    uint tid = thread_index_in_threadgroup;
+    for (short i = 0; i < co.get_capacity() && i < 31; ++i) {
+        if (co.is_valid_element(i)) {
+            auto ix = co.get_multidimensional_index(i);
+            OUT[tid * 32 + i] = int((ix[0] << 16) | ix[1]);
+        } else {
+            OUT[tid * 32 + i] = -1;
+        }
+    }
+    OUT[tid * 32 + 31] = int(co.get_capacity());
+"""
+
+_NAX_FLASH_BANDED_SOURCE = r"""
+    constexpr uint AQ = 32u;
+    constexpr uint AK = 64u;
+    const uint tgp_q = SWAP_GRID ? threadgroup_position_in_grid.y : threadgroup_position_in_grid.x;
+    const uint h = SWAP_GRID ? threadgroup_position_in_grid.x : threadgroup_position_in_grid.y;
+    const uint b = threadgroup_position_in_grid.z;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+
+    const uint L = uint(DIMS[0]);
+    const uint S_LEN = uint(DIMS[1]);
+    const uint lp = uint(DIMS[2 + b]);
+    const uint t0 = tgp_q * AQ;
+    if (t0 >= L) return;
+    const uint nq = min(AQ, L - t0);
+    const uint hk = h / (HQ / HKV);
+    const float sc = SCALE[0];
+
+    threadgroup float ss[AQ * AK];
+    threadgroup bfloat sp[AQ * AK];
+    threadgroup float sr[AQ];
+
+    const device bfloat* q_ptr = Q + ((size_t(b) * HQ + h) * L + t0) * D;
+    const device bfloat* kbase = K + (size_t(b) * HKV + hk) * S_LEN * D;
+    const device bfloat* vbase = V + (size_t(b) * HKV + hk) * S_LEN * D;
+    const device bfloat* rel_b = REL + (size_t(b) * L + t0) * HQ * R + h * R;
+
+    auto tq = tensor((device bfloat*)q_ptr, dextents<int32_t, 2>(D, int(nq)), array<int, 2>({1, D}));
+    auto ts = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(ss, dextents<int32_t, 2>(AK, AQ));
+    auto tp = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sp, dextents<int32_t, 2>(AK, AQ));
+    auto tv0 = tensor((device bfloat*)vbase, dextents<int32_t, 2>(D, AK), array<int, 2>({1, D}));
+
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, AK, D, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply), execution_simdgroups<8>> mm_qk;
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, D, AK, false, false, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<8>> mm_pv;
+
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+    for (short i = 0; i < 16; ++i) co[i] = 0.0f;
+    ushort cd[4], cr[4];
+    for (short q = 0; q < 4; ++q) {
+        const auto ix = co.get_multidimensional_index(4 * q);
+        cd[q] = ix[0];
+        cr[q] = ix[1];
+    }
+
+    float M[4], Sm[4];
+    for (short jj = 0; jj < 4; ++jj) {
+        const uint j = jj * 8u + sg;
+        M[jj] = (j < nq) ? SINK[((size_t(b) * L + (t0 + j)) * HQ) + h] : 0.0f;
+        Sm[jj] = 1.0f;
+    }
+
+    const uint pfirst = S_LEN - L + t0;
+    const uint plast = pfirst + nq - 1u;
+    uint kstart = lp;
+    if (WINDOW > 0 && pfirst + 1u > uint(WINDOW)) {
+        kstart = max(kstart, pfirst + 1u - uint(WINDOW));
+    }
+
+    if (kstart <= plast) {
+        for (uint kc = kstart; kc <= plast; kc += AK) {
+            const int nk = int(min(AK, S_LEN - kc));
+            {
+                auto tk = tensor((device bfloat*)(kbase + size_t(kc) * D), dextents<int32_t, 2>(D, nk), array<int, 2>({1, D}));
+                auto cs = mm_qk.template get_destination_cooperative_tensor<decltype(tq), decltype(tk), float>();
+                mm_qk.run(tq, tk, cs);
+                cs.store(ts);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int D0 = int(pfirst) - int(kc);
+            const bool fast = (nq == AQ) && (kc >= lp) && (D0 >= int(AK - 1u))
+                && (WINDOW == 0 || D0 + int(AQ - 1u) < WINDOW)
+                && (D0 - int(AK - 1u) >= R || D0 + int(AQ - 1u) < R);
+            const bool has_rel = (D0 - int(AK - 1u)) < R;
+            for (short jj = 0; jj < 4; ++jj) {
+                const uint j = jj * 8u + sg;
+                float s0 = ss[j * AK + lane] * sc;
+                float s1 = ss[j * AK + 32u + lane] * sc;
+                if (fast) {
+                    if (has_rel) {
+                        const uint d0 = uint(D0 + int(j) - int(lane));
+                        const device bfloat* rj = rel_b + size_t(j) * HQ * R;
+                        s0 += float(rj[d0]);
+                        s1 += float(rj[d0 - 32u]);
+                    }
+                } else {
+                    const int d0 = D0 + int(j) - int(lane);
+                    const int d1 = d0 - 32;
+                    const uint k0 = kc + lane;
+                    const uint k1 = kc + 32u + lane;
+                    const bool v0 = (j < nq) && (k0 >= lp) && (d0 >= 0) && (WINDOW == 0 || d0 < WINDOW);
+                    const bool v1 = (j < nq) && (k1 >= lp) && (d1 >= 0) && (WINDOW == 0 || d1 < WINDOW);
+                    if (v0 && d0 < R) s0 += float(rel_b[size_t(j) * HQ * R + uint(d0)]);
+                    if (v1 && d1 < R) s1 += float(rel_b[size_t(j) * HQ * R + uint(d1)]);
+                    if (!v0) s0 = -INFINITY;
+                    if (!v1) s1 = -INFINITY;
+                }
+                const float m = simd_max(max(M[jj], max(s0, s1)));
+                const float ms = exp(M[jj] - m);
+                M[jj] = m;
+                const float p0 = exp(s0 - m);
+                const float p1 = exp(s1 - m);
+                sp[j * AK + lane] = bfloat(p0);
+                sp[j * AK + 32u + lane] = bfloat(p1);
+                Sm[jj] = Sm[jj] * ms + simd_sum(p0 + p1);
+                if (lane == 0u) sr[j] = ms;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            {
+                const float r0 = sr[cr[0]], r1 = sr[cr[1]], r2 = sr[cr[2]], r3 = sr[cr[3]];
+                co[0] *= r0; co[1] *= r0; co[2] *= r0; co[3] *= r0;
+                co[4] *= r1; co[5] *= r1; co[6] *= r1; co[7] *= r1;
+                co[8] *= r2; co[9] *= r2; co[10] *= r2; co[11] *= r2;
+                co[12] *= r3; co[13] *= r3; co[14] *= r3; co[15] *= r3;
+            }
+            auto tv = tensor((device bfloat*)(vbase + size_t(kc) * D), dextents<int32_t, 2>(D, nk), array<int, 2>({1, D}));
+            mm_pv.run(tp, tv, co);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short jj = 0; jj < 4; ++jj) {
+        if (lane == 0u) sr[jj * 8u + sg] = 1.0f / Sm[jj];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device bfloat* out_b = OUT + (size_t(b) * L + t0) * HQ * D + h * D;
+    for (short q = 0; q < 4; ++q) {
+        const uint row = cr[q];
+        if (row < nq) {
+            const float4 v = float4(co[4 * q], co[4 * q + 1], co[4 * q + 2], co[4 * q + 3]) * sr[row];
+            *(device bfloat4*)(out_b + size_t(row) * HQ * D + cd[q]) = bfloat4(v);
+        }
+    }
+"""
+
+_nax_attn_supported: bool | None = None
+_nax_flash_banded_kernel = None
+
+
+def can_use_nax_attn() -> bool:
+    """Return True if Metal 4 matmul2d PV accumulator matches 4 quads of 4 consecutive dims."""
+    global _nax_attn_supported
+    if _nax_attn_supported is not None:
+        return _nax_attn_supported
+    if not is_nax_available() or mx.default_device() != mx.gpu:
+        _nax_attn_supported = False
+        return False
+    try:
+        probe = mx.fast.metal_kernel(
+            name="omlx_inkling2_nax_attn_probe",
+            input_names=["V"],
+            output_names=["OUT"],
+            header=_NAX_MOE_HEADER,
+            source=_NAX_ATTN_PROBE_SOURCE,
+        )
+        out = probe(
+            inputs=[mx.zeros((64, 128), dtype=mx.bfloat16)],
+            output_shapes=[(256 * 32,)],
+            output_dtypes=[mx.int32],
+            grid=(256, 1, 1),
+            threadgroup=(256, 1, 1),
+        )[0]
+        mx.eval(out)
+        arr = out.tolist()
+        ok = arr[31] == 16
+        if ok:
+            for tid in range(256):
+                base = tid * 32
+                for q in range(4):
+                    d0 = arr[base + 4 * q] >> 16
+                    r0 = arr[base + 4 * q] & 0xFFFF
+                    if d0 % 4 != 0:
+                        ok = False
+                        break
+                    for j in range(1, 4):
+                        vj = arr[base + 4 * q + j]
+                        if (vj >> 16) != d0 + j or (vj & 0xFFFF) != r0:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+        _nax_attn_supported = ok
+    except Exception:
+        _nax_attn_supported = False
+    return _nax_attn_supported
+
+
+def flash_banded_attention_nax(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    rel: mx.array,
+    sink: mx.array,
+    *,
+    scale: float,
+    window: int,
+    left_padding=None,
+) -> mx.array:
+    """M5 Metal 4 matmul2d banded-sink FlashAttention (BF16 or FP8 E4M3 K/V)."""
+    global _nax_flash_banded_kernel
+    if _nax_flash_banded_kernel is None:
+        _nax_flash_banded_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_flash_banded_nax",
+            input_names=["Q", "K", "V", "REL", "SINK", "DIMS", "SCALE"],
+            output_names=["OUT"],
+            header=_NAX_MOE_HEADER,
+            source=_NAX_FLASH_BANDED_SOURCE,
+        )
+    b, hq, length, d = q.shape
+    hkv, s = k.shape[1], k.shape[2]
+    lp = (
+        left_padding.astype(mx.int32)
+        if left_padding is not None
+        else mx.zeros((b,), dtype=mx.int32)
+    )
+    if window and s > length + window - 1:
+        lo = s - length - window + 1
+        k = k[:, :, lo:]
+        v = v[:, :, lo:]
+        s = k.shape[2]
+        lp = mx.maximum(lp - lo, 0)
+    if k.dtype == mx.uint8:
+        k = fp8_e4m3_dequantize(k, mx.bfloat16)
+        v = fp8_e4m3_dequantize(v, mx.bfloat16)
+    dims = mx.concatenate([mx.array([length, s], dtype=mx.int32), lp])
+    # For long full-attention contexts (>4K keys), sweep Q-tiles in Y per head so
+    # one KV head stays resident in M5 Pro's 24-32 MB SLC across all Q-tiles.
+    swap_grid = 1 if (not window and s > 4096) else 0
+    q_tiles = (length + 31) // 32
+    grid = (hq * 256, q_tiles, b) if swap_grid else (q_tiles * 256, hq, b)
+    out = _nax_flash_banded_kernel(
+        inputs=[
+            mx.contiguous(q),
+            mx.contiguous(k),
+            mx.contiguous(v),
+            mx.contiguous(rel),
+            mx.contiguous(sink.astype(mx.float32)),
+            dims,
+            mx.array([scale], dtype=mx.float32),
+        ],
+        template=[
+            ("D", d),
+            ("HQ", hq),
+            ("HKV", hkv),
+            ("R", rel.shape[-1]),
+            ("WINDOW", int(window)),
+            ("SWAP_GRID", swap_grid),
+        ],
+        grid=grid,
+        threadgroup=(256, 1, 1),
+        output_shapes=[(b, length, hq, d)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    return out.transpose(0, 2, 1, 3)

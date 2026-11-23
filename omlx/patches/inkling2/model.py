@@ -342,6 +342,27 @@ class Inkling2Experts(nn.Module):
                 self._packed_up_params,
                 self._inv_nvfp4,
             )
+        if (
+            x.shape[0] >= 64
+            and x.dtype == mx.bfloat16
+            and self.w13.bits == 4
+            and self.w2.bits == 4
+            and self.w13.mode == self.w2.mode
+            and self.w13.mode in ("nvfp4", "affine")
+            and x.shape[1] % 64 == 0
+            and (self.w13.weight.shape[1] // 2) % 32 == 0
+            and self.w13.weight.shape[0] <= 256
+            and kernels.can_use_nax_moe()
+        ):
+            return kernels.moe_prefill_nax(
+                x,
+                self.w13,
+                self.w2,
+                inds,
+                weights,
+                self._packed_up_params,
+                self._inv_nvfp4,
+            )
         xe = mx.expand_dims(x, (-2, -3))
         do_sort = inds.size >= 64
         idx = inds
@@ -386,9 +407,25 @@ class Inkling2MoE(nn.Module):
         self.router_bias = mx.zeros((args.n_routed_experts,), dtype=mx.float32)
         self.experts = Inkling2Experts(args, w13_spec, w2_spec)
 
+    def _router_weight_fast(self) -> mx.array:
+        cached = getattr(self, "_fast_router_cache", None)
+        if cached is not None and cached[0] is self.router_weight:
+            return cached[1]
+        rw = self.router_weight
+        if rw.dtype == mx.float32:
+            bf = rw.astype(mx.bfloat16)
+            exact = bool(mx.all(rw == bf.astype(mx.float32)).item())
+            fast = bf if exact else rw
+        else:
+            fast = rw
+        self._fast_router_cache = (rw, fast)
+        return fast
+
     def route(self, x: mx.array):
         if x.shape[0] <= 16 and x.shape[1] % 4 == 0 and mx.default_device() == mx.gpu:
-            logits = kernels.fast_router_logits(x, self.router_weight)
+            cached = getattr(self, "_fast_router_cache", None)
+            rw = cached[1] if (cached is not None and cached[0] is self.router_weight) else self.router_weight
+            logits = kernels.fast_router_logits(x, rw)
         else:
             logits = x.astype(mx.float32) @ self.router_weight.T
         return kernels.route_topk(
@@ -443,7 +480,7 @@ def _mix_messages(x, message, down, gain_forget, down_t=None, gf_t=None):
     return (1.0 - forget) * x + gain * message
 
 
-def _static_conv(x, w, state, scale, scale_arr=None):
+def _static_conv(x, w, state, scale, scale_arr=None, residual=None, out_dtype=None):
     """Depthwise causal conv (taps: ``w[:, K-1]`` is the current token).
 
     On GPU with K=4, returns ``(out, next_state, raw_x)`` from a single fused
@@ -457,7 +494,9 @@ def _static_conv(x, w, state, scale, scale_arr=None):
             if scale_arr is not None
             else mx.array([scale], dtype=mx.float32)
         )
-        out, next_state = kernels.static_conv4_fused(x, w, state, sc)
+        out, next_state = kernels.static_conv4_fused(
+            x, w, state, sc, residual=residual, out_dtype=out_dtype
+        )
         return out, next_state, x
     xf = x.astype(mx.float32)
     xp = mx.concatenate([state, xf], axis=1)
@@ -467,8 +506,11 @@ def _static_conv(x, w, state, scale, scale_arr=None):
         out = out + w[:, j] * xp[:, j : j + length]
     # The reference rounds the depthwise conv to the weight dtype before the
     # residual add.
-    out = (out.astype(w.dtype).astype(mx.float32) + xf) * scale
-    return out.astype(x.dtype), xp, None
+    out = ((out.astype(w.dtype).astype(mx.float32) + xf) * scale).astype(x.dtype)
+    if residual is not None:
+        out = residual.astype(mx.float32) + out.astype(mx.float32)
+    odtype = x.dtype if out_dtype is None else out_dtype
+    return out.astype(odtype), xp, None
 
 
 def _dynamic_conv(x, dyn, static_w, state, heads, scale):
@@ -787,13 +829,15 @@ class Inkling2Layer(nn.Module):
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None, down_t=None, gf_t=None):
         a = self.attn.output(out, gate)
-        a, s2, ra = _static_conv(
-            a, self.attn_conv, s2, self._conv_scale, self._conv_scale_arr
+        residual, s2, ra = _static_conv(
+            a,
+            self.attn_conv,
+            s2,
+            self._conv_scale,
+            self._conv_scale_arr,
+            residual=None if self.is_boundary else h,
+            out_dtype=mx.float32,
         )
-        if self.is_boundary:
-            residual = a.astype(mx.float32)
-        else:
-            residual = h.astype(mx.float32) + a.astype(mx.float32)
         y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
         if messages is not None:
             y = _mix_messages(
@@ -805,10 +849,15 @@ class Inkling2Layer(nn.Module):
                 None if gf_t is None else gf_t[3:],
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
-        m, s3, rm = _static_conv(
-            m, self.mlp_conv, s3, self._conv_scale, self._conv_scale_arr
+        out_h, s3, rm = _static_conv(
+            m,
+            self.mlp_conv,
+            s3,
+            self._conv_scale,
+            self._conv_scale_arr,
+            residual=residual,
+            out_dtype=h.dtype,
         )
-        out_h = (residual + m.astype(mx.float32)).astype(h.dtype)
         if ra is not None:
             return out_h, s2, s3, ra, rm
         return out_h, s2, s3
@@ -836,6 +885,8 @@ class Inkling2Layer(nn.Module):
         down_t = gf_t = None
         if messages is not None and b * length <= kernels._LOOP_FUSED_MAX_ROWS:
             down_t, gf_t = self._packed_loop()
+        if b * length <= 16 and mx.default_device() == mx.gpu:
+            self.mlp._router_weight_fast()
         pre_out = pre(h, blocks, states[0], states[1], tau, messages, down_t, gf_t)
         if len(pre_out) == 11:
             q, k, v, rel, gate, sink, ks, vs, rk, rv, h_n = pre_out
