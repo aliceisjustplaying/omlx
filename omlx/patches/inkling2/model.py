@@ -171,6 +171,34 @@ def _softcap(x: mx.array, cap: float) -> mx.array:
     return mx.tanh(x / cap) * cap
 
 
+def _logit_tail(logits: mx.array, cap: float, bias: mx.array | None) -> mx.array:
+    logits = _softcap(logits.astype(mx.float32), cap)
+    return logits if bias is None else logits + bias
+
+
+_logit_tail_compiled = mx.compile(_logit_tail)
+
+
+def _keep_fp32_weight(norm: nn.Module) -> None:
+    """Keep an FP32 copy of an RMSNorm weight outside the parameter tree."""
+    if type(norm) is not nn.RMSNorm:
+        return
+    weight = norm.weight
+    held = norm.__dict__.get("_omlx_fp32_weight")
+    if held is None or held[0] is not weight:
+        copy = weight.astype(mx.float32)
+        mx.eval(copy)
+        object.__setattr__(norm, "_omlx_fp32_weight", (weight, copy))
+
+
+def _norm(norm: nn.Module, x: mx.array) -> mx.array:
+    """Avoid per-call BF16->FP32 norm weight casts when normalizing FP32 inputs."""
+    held = norm.__dict__.get("_omlx_fp32_weight")
+    if x.dtype == mx.float32 and held is not None and held[0] is norm.weight:
+        return mx.fast.rms_norm(x, held[1], norm.eps)
+    return norm(x)
+
+
 @mx.compile
 def _l2_clip(x: mx.array, scale: mx.array, threshold: mx.array) -> mx.array:
     xf = x.astype(mx.float32) * scale
@@ -333,6 +361,22 @@ class Inkling2Experts(nn.Module):
             and self.w13.weight.shape[1] % 32 == 0
             and inds.shape[1] <= 8
         ):
+            if (
+                x.dtype == mx.bfloat16
+                and x.shape[1] % 64 == 0
+                and (self.w13.weight.shape[1] // 2) % 32 == 0
+                and x.shape[0] >= 10
+                and kernels._nax_moe_supported is True
+            ):
+                return kernels.moe_prefill_nax(
+                    x,
+                    self.w13,
+                    self.w2,
+                    inds,
+                    weights,
+                    self._packed_up_params,
+                    self._inv_nvfp4,
+                )
             return kernels.moe_fused_packed(
                 x,
                 self.w13,
@@ -539,8 +583,15 @@ def _static_conv(x, w, state, scale, scale_arr=None, residual=None, out_dtype=No
     return out.astype(odtype), xp, None
 
 
-def _dynamic_conv(x, dyn, static_w, state, heads, scale):
+def _dynamic_conv(x, dyn, static_w, state, heads, scale, scale_arr=None):
     """Per-token taps ``static_w[lag] + dyn[head, lag]`` over k/v channels."""
+    if mx.default_device() == mx.gpu:
+        sc = (
+            scale_arr
+            if scale_arr is not None
+            else mx.array([scale], dtype=mx.float32)
+        )
+        return kernels.dynamic_conv_fused(x, dyn, static_w, state, heads, sc)
     xf = x.astype(mx.float32)
     b, length, c = xf.shape
     k = static_w.shape[0]
@@ -675,6 +726,7 @@ class Inkling2Attention(nn.Module):
         self._sconv_scale = 1.0 / math.sqrt(self.conv_k + 1)
         self._sconv_scale_arr = mx.array([self._sconv_scale], dtype=mx.float32)
         self._dconv_scale = 1.0 / math.sqrt(2 * self.conv_k + 1)
+        self._dconv_scale_arr = mx.array([self._dconv_scale], dtype=mx.float32)
 
     def log_tau(self, kv, length: int):
         """Query/relative-state log scaling for long positions (full layers)."""
@@ -730,6 +782,7 @@ class Inkling2Attention(nn.Module):
                 ks,
                 self.n_kv,
                 self._dconv_scale,
+                self._dconv_scale_arr,
             )
             v, vs = _dynamic_conv(
                 vp[..., :dkv],
@@ -738,6 +791,7 @@ class Inkling2Attention(nn.Module):
                 vs,
                 self.n_kv,
                 self._dconv_scale,
+                self._dconv_scale_arr,
             )
             rk = rv = None
         if (
@@ -984,12 +1038,12 @@ class Inkling2Layer(nn.Module):
                 None if gf_t is None else gf_t[:3],
             )
             if self.sliding:
-                mixed_m = self.attn_norm(mixed_m).astype(dtype)
+                mixed_m = _norm(self.attn_norm, mixed_m).astype(dtype)
                 xq, xk, xv = mixed_m[0], mixed_m[1], mixed_m[2]
             else:
-                xq = self.q_input_norm(mixed_m[0]).astype(dtype)
-                xk = self.k_input_norm(mixed_m[1]).astype(dtype)
-                xv = self.v_input_norm(mixed_m[2]).astype(dtype)
+                xq = _norm(self.q_input_norm, mixed_m[0]).astype(dtype)
+                xk = _norm(self.k_input_norm, mixed_m[1]).astype(dtype)
+                xv = _norm(self.v_input_norm, mixed_m[2]).astype(dtype)
         proj = self.attn.project(xq, xk, xv, ks, vs, tau)
         if self.is_boundary:
             return (*proj, h_n)
@@ -1024,7 +1078,7 @@ class Inkling2Layer(nn.Module):
                 None if down_t is None else down_t[3:],
                 None if gf_t is None else gf_t[3:],
             )[0]
-            m = self.mlp(self.mlp_norm(y).astype(h.dtype))
+            m = self.mlp(_norm(self.mlp_norm, y).astype(h.dtype))
         out_h, s3, rm = _static_conv(
             m,
             self.mlp_conv,
@@ -1078,6 +1132,7 @@ class Inkling2Layer(nn.Module):
             states[0],
             attn.n_kv,
             attn._dconv_scale,
+            attn._dconv_scale_arr,
         )
         v, vs = _dynamic_conv(
             vp[..., :dkv],
@@ -1086,6 +1141,7 @@ class Inkling2Layer(nn.Module):
             states[1],
             attn.n_kv,
             attn._dconv_scale,
+            attn._dconv_scale_arr,
         )
         xq_t = xq[:, -tail:, :]
         q_t, r_t, gate_t, sink_t = mx.split(
@@ -1189,7 +1245,7 @@ class Inkling2Layer(nn.Module):
             conv[3] = s3 if rm is not None else s3[:, -keep:] * 1.0
         return out_h
 
-    def __call__(self, h, blocks, cache=None, bank=None):
+    def __call__(self, h, blocks, cache=None, bank=None, tau=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
         FP32 completed blocks; extended in place at a block boundary.
         ``bank``: the previous loop pass's ``(blocks, partial_n)`` messages."""
@@ -1204,7 +1260,21 @@ class Inkling2Layer(nn.Module):
             if s is None:
                 s = mx.zeros((b, self._conv_k - 1, width), dtype=mx.float32)
             states.append(s)
-        tau = self.attn.log_tau(kv, length)
+        if tau is None:
+            tau = self.attn.log_tau(kv, length)
+        if bank is not None:
+            norms = (
+                (self.attn_norm, self.mlp_norm)
+                if self.sliding
+                else (
+                    self.q_input_norm,
+                    self.k_input_norm,
+                    self.v_input_norm,
+                    self.mlp_norm,
+                )
+            )
+            for norm in norms:
+                _keep_fp32_weight(norm)
         compiled = length <= _COMPILED_MAX_TOKENS
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
@@ -1215,6 +1285,7 @@ class Inkling2Layer(nn.Module):
         if b * length <= 16 and mx.default_device() == mx.gpu:
             self.mlp._router_weight_fast()
             self.mlp._prepare_packed_views()
+            kernels.can_use_nax_moe()
         pre_out = pre(h, blocks, states[0], states[1], tau, messages, down_t, gf_t)
         if self.is_boundary:
             h_n = pre_out[-1]
@@ -1254,8 +1325,10 @@ class Inkling2Layer(nn.Module):
                     # Fused static_conv4 already wrote the exact (B, 3, C) next state.
                     conv[base + slot] = nxt
                 else:
-                    # A small copy, so the state does not pin the chunk's window.
-                    conv[base + slot] = nxt[:, -keep:] * 1.0
+                    # Prefill tails are copied so state does not pin the chunk;
+                    # decode/verify windows are a few rows and stay views.
+                    tail = nxt[:, -keep:]
+                    conv[base + slot] = tail if compiled else tail * 1.0
         return h
 
 
@@ -1317,9 +1390,9 @@ class Inkling2TextModel(nn.Module):
         ]
 
     # Decode/verify steps build ~1,900 dispatches across 48 visits; start
-    # encoding every 8 visits so the GPU stays busy while Python builds the
+    # encoding every 6 visits so the GPU stays busy while Python builds the
     # remaining visits (scheduling only, bit-exact).
-    _DECODE_EVAL_EVERY = 8
+    _DECODE_EVAL_EVERY = 6
 
     def __call__(
         self,
@@ -1338,7 +1411,7 @@ class Inkling2TextModel(nn.Module):
             h = self.embed_norm(self.embed(inputs))
         visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
         blocks: list = []
-        prelude = bank = None
+        prelude = bank = tau = None
         eval_every = (
             self._DECODE_EVAL_EVERY
             if h.shape[0] == 1 and h.shape[1] <= _COMPILED_MAX_TOKENS
@@ -1346,6 +1419,7 @@ class Inkling2TextModel(nn.Module):
         )
         n_visits = self.num_visits
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
+            layer = self.layers[idx]
             if idx == self._core_start and prelude is None:
                 prelude = (h, list(blocks))
             elif idx == self._core_start:
@@ -1363,13 +1437,21 @@ class Inkling2TextModel(nn.Module):
                 and visit + 1 == n_visits
                 and capture is None
                 and h.shape[1] >= 64
-                and not self.layers[idx].sliding
+                and not layer.sliding
                 and loop_pass == 0
                 and c is not None
                 and c[0] is not None
             ):
-                return self.layers[idx]._forward_last_visit_tail(h, blocks, cache=c)
-            h = self.layers[idx](h, blocks, cache=c, bank=bank if loop_pass else None)
+                return layer._forward_last_visit_tail(h, blocks, cache=c)
+            if not layer.sliding and tau is None:
+                tau = layer.attn.log_tau(c[0] if c is not None else None, h.shape[1])
+            h = layer(
+                h,
+                blocks,
+                cache=c,
+                bank=bank if loop_pass else None,
+                tau=None if layer.sliding else tau,
+            )
             if eval_every and (visit + 1) % eval_every == 0 and visit + 1 < n_visits:
                 mx.async_eval(h)
         out = self.final_input.mix_raw(
@@ -1406,11 +1488,9 @@ class Model(nn.Module):
             ).astype(mx.float32)
 
     def logits_from_hidden(self, h):
-        logits = self.lm_head(h).astype(mx.float32)
-        logits = _softcap(logits, self._softcap)
-        if self._vocab_bias is not None:
-            logits = logits + self._vocab_bias
-        return logits
+        compiled = h.shape[-2] <= _COMPILED_MAX_TOKENS
+        tail = _logit_tail_compiled if compiled else _logit_tail
+        return tail(self.lm_head(h), self._softcap, self._vocab_bias)
 
     def encode_image(self, pixel_values: mx.array, image_grid_thw) -> mx.array:
         """Image-token embeddings for the processor's pixel blocks."""
@@ -1574,7 +1654,7 @@ class Model(nn.Module):
                             axis=1,
                         )
                 else:
-                    conv[base + slot] = xp[:, keep : keep + width] * 1.0
+                    conv[base + slot] = xp[:, keep : keep + width]
             conv._omlx_verify_xp = None
         return True
 

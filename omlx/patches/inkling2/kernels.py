@@ -2140,6 +2140,93 @@ def static_conv4_fused(
     return out, next_state
 
 
+_DYNAMIC_CONV_HEADER = r"""
+template <typename T, typename S, typename X>
+inline float _ink2_dconv_padded(
+    const device S* srow,
+    int64_t ss,
+    const device X* xrow,
+    int64_t xs,
+    int p,
+    int i
+) {
+    return i < p ? float(srow[i * ss]) : float(T(xrow[(i - p) * xs]));
+}
+"""
+
+_DYNAMIC_CONV_SOURCE = r"""
+    constexpr int P = K - 1;
+    const int c = thread_position_in_grid.x;
+    const int y = thread_position_in_grid.y;
+    const int b = thread_position_in_grid.z;
+    const int L = x_shape[1];
+    const int C = x_shape[2];
+    const device S* srow = state + b * state_strides[0] + c * state_strides[2];
+    const device T* xrow = x + b * x_strides[0] + c * x_strides[2];
+    const int64_t ss = state_strides[1];
+    const int64_t xs = x_strides[1];
+    const float own = _ink2_dconv_padded<T>(srow, ss, xrow, xs, P, y);
+    xp[((size_t)b * (P + L) + y) * C + c] = own;
+    if (y < P) return;
+    const int t = y - P;
+    const int head = c / (C / H);
+    const auto drow = dyn + b * dyn_strides[0] + t * dyn_strides[1]
+        + head * K * dyn_strides[2];
+    float acc = 0.0f;
+    for (int lag = 0; lag < K; ++lag) {
+        const float sw = float(static_w[lag * static_w_strides[0]
+                                        + c * static_w_strides[1]]);
+        const float tap = sw + float(drow[lag * dyn_strides[2]]);
+        const float term = _ink2_dconv_padded<T>(srow, ss, xrow, xs, P, y - lag)
+            * tap;
+        acc = lag == 0 ? term : acc + term;
+    }
+    const float res = acc + own;
+    const float o = res * scale[0];
+    out[((size_t)b * L + t) * C + c] = O(float(T(o)));
+"""
+_dynamic_conv_kernel = None
+
+
+def dynamic_conv_fused(
+    x: mx.array,
+    dyn: mx.array,
+    static_w: mx.array,
+    state: mx.array,
+    heads: int,
+    scale_arr: mx.array,
+    out_dtype=None,
+) -> tuple[mx.array, mx.array]:
+    """Fused strided dynamic causal conv for full-attention K/V."""
+    global _dynamic_conv_kernel
+    if _dynamic_conv_kernel is None:
+        _dynamic_conv_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_dynamic_conv",
+            input_names=["x", "dyn", "static_w", "state", "scale"],
+            output_names=["out", "xp"],
+            header=_DYNAMIC_CONV_HEADER,
+            source=_DYNAMIC_CONV_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    b, length, channels = x.shape
+    k = static_w.shape[0]
+    odtype = x.dtype if out_dtype is None else out_dtype
+    return _dynamic_conv_kernel(
+        inputs=[x, dyn, static_w, state, scale_arr],
+        template=[
+            ("T", x.dtype),
+            ("S", state.dtype),
+            ("O", odtype),
+            ("K", k),
+            ("H", heads),
+        ],
+        grid=(channels, length + k - 1, b),
+        threadgroup=(min(channels, 256), 1, 1),
+        output_shapes=[(b, length, channels), (b, length + k - 1, channels)],
+        output_dtypes=[odtype, mx.float32],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fast exact FP32 router and fused multi-row packed MoE kernels (NVFP4 / Affine-4)
 # ---------------------------------------------------------------------------
@@ -2600,7 +2687,7 @@ def moe_fused_packed(
     w13_w, w13_s, w13_b = _moe_packed_views(w13)
     w2_w, w2_s, w2_b = _moe_packed_views(w2)
     if w13.mode == "nvfp4":
-        if rows >= 3 and w13.weight.shape[0] <= 128:
+        if rows >= 2 and w13.weight.shape[0] <= 128:
             if _moe_plan16_kernel is None:
                 _moe_plan16_kernel = mx.fast.metal_kernel(
                     name="omlx_inkling2_moe_plan16",
@@ -3234,7 +3321,13 @@ def moe_prefill_nax(
     inter = w13.weight.shape[1] // 2
     nsg = 4 if rows < 1024 else 8
     tile_sz = nsg * 16
-    max_tiles = (rows * top_k) // tile_sz + experts
+    max_tiles = (
+        min(experts, rows * top_k)
+        if rows <= tile_sz
+        else ((rows * top_k) // tile_sz + experts)
+    )
+    w13_w, w13_s, w13_b = _moe_packed_views(w13)
+    w2_w, w2_s, w2_b = _moe_packed_views(w2)
 
     if _nax_moe_route_kernel is None:
         _nax_moe_route_kernel = mx.fast.metal_kernel(
@@ -3296,7 +3389,7 @@ def moe_prefill_nax(
                 source=_NAX_MOE_DN_NVFP4_SOURCE,
             )
         act = _nax_moe_up_nvfp4_kernel(
-            inputs=[xg, w13.weight, w13.scales, w13.global_scale, tiles, ntiles, up_params],
+            inputs=[xg, w13_w, w13_s, w13.global_scale, tiles, ntiles, up_params],
             template=[("K_DIM", hidden), ("FF_DIM", inter)],
             grid=(max_tiles * nsg * 32, inter // 32, 1),
             threadgroup=(nsg * 32, 1, 1),
@@ -3304,7 +3397,7 @@ def moe_prefill_nax(
             output_dtypes=[mx.bfloat16],
         )[0]
         yd = _nax_moe_dn_nvfp4_kernel(
-            inputs=[act, w2.weight, w2.scales, w2.global_scale, tiles, ntiles, dn_params],
+            inputs=[act, w2_w, w2_s, w2.global_scale, tiles, ntiles, dn_params],
             template=[("K_DIM", inter), ("OUT_DIM", hidden)],
             grid=(max_tiles * nsg * 32, hidden // 64, 1),
             threadgroup=(nsg * 32, 1, 1),
@@ -3328,7 +3421,7 @@ def moe_prefill_nax(
                 source=_NAX_MOE_DN_AFF4_SOURCE,
             )
         act = _nax_moe_up_aff4_kernel(
-            inputs=[xg, w13.weight, w13.scales, w13.biases, tiles, ntiles, up_params],
+            inputs=[xg, w13_w, w13_s, w13_b, tiles, ntiles, up_params],
             template=[
                 ("S_T", w13.scales.dtype),
                 ("GS", w13.group_size),
@@ -3341,7 +3434,7 @@ def moe_prefill_nax(
             output_dtypes=[mx.bfloat16],
         )[0]
         yd = _nax_moe_dn_aff4_kernel(
-            inputs=[act, w2.weight, w2.scales, w2.biases, tiles, ntiles],
+            inputs=[act, w2_w, w2_s, w2_b, tiles, ntiles],
             template=[
                 ("S_T", w2.scales.dtype),
                 ("GS", w2.group_size),

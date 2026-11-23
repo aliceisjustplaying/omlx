@@ -2,7 +2,7 @@
 
 This fork extends [`jundot/omlx`](https://github.com/jundot/omlx) and [`masterfasa/omlx`](https://github.com/masterfasa/omlx) (`feat/inkling2-basalt-combined`, commit `e1bffb9`) with six targeted Python and Metal kernel changes (`+3,378 / -121` lines) for **Inkling 2 Mini** (`oQ4e` mixed 4-bit NVFP4/Affine-4 experts with its bundled **DSpark** recurrent draft head) on Apple Silicon.
 
-On an **Apple M5 Pro (48 GB unified memory)**, this branch reaches **1,540–1,588 tok/s** cold prefill at 6.7K (`4.39–4.51s` TTFT), **1,510–1,532 tok/s** at 27K (`13.92–14.10s`) and **1,195–1,239 tok/s** at 54K (up to +82% faster long-context prefill vs before the M5 Metal 4 and fusion patches), **73–119 tok/s** on short coding/JSON/editing tasks (`0.16–0.18s` TTFT) and **51–58 tok/s** sampled decode from 6.7K to 54K context (**0.22–0.64s** warm TTFT on full-prefix retries).
+On an **Apple M5 Pro (48 GB unified memory)**, this branch reaches **1,693 tok/s** cold prefill at 6.7K (`4.11s` TTFT), **1,594 tok/s** at 27K (`13.37s`) and **1,303 tok/s** at 54K (+91% faster long-context prefill vs before the M5 Metal 4 and fusion patches), **81.6 tok/s** greedy 512-token code (3-run median, peak 82.9), **57.3 tok/s** greedy chat (peak 58.8), **105.6 / 106.3 tok/s** JSON, **125.7 / 124.5 tok/s** file edit (`0.15–0.18s` TTFT) and **50.5–55.7 tok/s** sampled decode from 6.7K to 54K context (**0.22–0.64s** warm TTFT on full-prefix retries).
 
 > **Default tradeoff**: This branch defaults `OMLX_INKLING2_FP8_KV` to `"all"` (lossy unit-scale FP8 E4M3 KV cache across all attention layers) for long-context throughput and memory headroom. Set `OMLX_INKLING2_FP8_KV=0` for BF16 KV cache.
 
@@ -177,3 +177,24 @@ curl -s http://127.0.0.1:8000/v1/models
 - **[`ShinMegamiBoson/lookatmyquant`](https://github.com/ShinMegamiBoson/lookatmyquant)** — pre-planned expert-grouping design inspiration for shared MoE experts across `L=3..16`.
 - **[`Eriskii/erisinky`](https://github.com/Eriskii/erisinky)** — Metal 4 `mpp::tensor_ops::matmul2d` FlashAttention (`k_attn_h`), per-simdgroup `matmul2d` MoE prefill (`k_moe_sg`), Y-axis cache-locality dispatch order, bit-exact BF16 router weights and fused post-conv+residual epilogues.
 - **[`ARahim3/mlx-dspark`](https://github.com/ARahim3/mlx-dspark)** — fused Inkling 2 attention head-prep (`inkling_fused.py`), fused output gating and bit-exact wide-M 8-bit prefill GEMMs (`wide_gemm.py`).
+
+
+### Latest Pass: oMLX 0.8.3 Launch Cuts, Wide-Verify NAX MoE (`L>=10`) & Causal Sampled Stopping
+
+- **Zero-copy strided `dynamic_conv_fused` (`kernels.py`, `model.py`)**: Replaces eager per-lag full-attention K/V dynamic convolutions with a single strided Metal kernel (`ensure_row_contiguous=False`, `0.000000` max diff across `L = 1..2048`), eliminating ~368 small launches per forward.
+- **oMLX 0.8.3 (`#5538`) launch reductions (`model.py`)**: Adds compiled `_logit_tail_compiled` (fusing FP32 cast, softcap and vocab bias for `L <= 16`), caches FP32 RMSNorm weight copies outside the parameter tree (`_keep_fp32_weight` / `_norm`) to drop ~84 BF16-to-FP32 weight casts on looped visits, shares `log_tau` across all 8 full-attention visits and keeps zero-copy conv state views on short decode/verify windows and rollbacks.
+- **M5 NAX wide-verify MoE (`L >= 10`) & `L = 2` grouped NVFP4 (`kernels.py`, `model.py`)**: Lowers grouped NVFP4 `moe_fused_packed` to `rows >= 2` (100% bit-exact for all `L = 1..9` DSpark verify passes) and routes wide copy-mode verify windows (`L = 10..16`) through `moe_prefill_nax` with tight `max_tiles = min(experts, rows * top_k)` (saving `10–20 ms` per 16-row verify pass).
+- **Tighter decode `async_eval` pipelining (`model.py`)**: Lowers `_DECODE_EVAL_EVERY` from `8` to `6` visits (8 chunks across 48 visits) so the GPU starts executing 2 visits earlier while Python builds the remaining graph.
+- **Exact causal sampled `DraftPolicy` stopping (`draft_policy.py`, `batch_generator.py`, `dspark.py`)**: Adds `DraftPolicy.causal_window(conf)` with an isolated sampled-mode confidence calibrator. Each decision `{k >= i + 1}` uses only `conf[:i + 1]` (computed from `(h_main, d_0..d_{i-1})` before drawing `d_i`), preserving mathematically exact speculative rejection sampling while letting sampled JSON and edit runs stretch up to `k = 7` on high-confidence spans.
+
+| Workload (Apple M5 Pro 48 GB, latest pass) | Prefill / TTFT | Decode Throughput |
+| :--- | :---: | :---: |
+| Cold 6.7K prompt (`0` cached, sampled `temp=1.0`) | **1,693 tok/s** (`4.11s`) | **54.3 tok/s** |
+| Turn 2 27.2K prompt (`6.1K` cached, sampled) | **1,594 tok/s** (`13.37s`) | **55.7 tok/s** |
+| Turn 3 53.9K prompt (`26.6K` cached, sampled) | **1,303 tok/s** (`21.09s`) | **50.5 tok/s** |
+| Warm 53.9K retry (`53.9K` cached, sampled) | `0.22–0.64s` TTFT | **51.4–55.0 tok/s** |
+| Short JSON (sampled / greedy) | `0.16–0.18s` TTFT | **105.6 / 106.3 tok/s** |
+| Short file edit (sampled / greedy) | `0.17s` TTFT | **125.7 / 124.5 tok/s** |
+| Greedy 512-tok code (3-run median) | `0.16s` TTFT | **81.6 tok/s** (peak 82.9) |
+| Greedy 512-tok chat (3-run median) | `0.15s` TTFT | **57.3 tok/s** (peak 58.8) |
+| Tool call (`read` `/etc/hosts`, greedy) | — | **1.09s** total |

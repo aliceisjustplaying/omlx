@@ -2375,10 +2375,12 @@ def _make_inkling2_dspark_drafter_cls():
                     max_proposals = max(2, min(4, want + 1))
                     if max_proposals < draft_hidden.shape[1]:
                         draft_hidden = draft_hidden[:, :max_proposals]
-                elif not greedy and can_screen_sampled:
-                    # Slice before prepare_block + screen_base to DraftPolicy's pre-draw
-                    # window (+1 upward headroom so policy.choose can climb without
-                    # stalling on post-draw confidence readbacks).
+                elif not greedy and can_screen_sampled and not self.confidence_windows:
+                    # Without per-block confidence windows, slice before
+                    # prepare_block + screen_base to DraftPolicy's pre-draw
+                    # window (+1 upward headroom). With confidence_windows on,
+                    # draft the full block so causal_window can stretch on
+                    # high-confidence code/JSON spans.
                     want_s = max(
                         (int(getattr(state, "_policy_k", 3) or 3) for state, *_ in rows),
                         default=3,

@@ -4924,16 +4924,20 @@ def _run_verify_cycle_chain(
     own_forward = verify_result is None
     cycle_conf = None
     if drafter is not None and own_forward and policy is not None:
-        if is_greedy and not state.copy_drafts:
+        if not state.copy_drafts:
             cycle_conf = _stated_chances(state)
         if cycle_conf:
-            # Greedy only: the head stated each draft's chance; the window is the
-            # one with the most expected tokens per millisecond for this block.
-            _clip_block_drafts(state, policy.window(cycle_conf) - 1)
+            if is_greedy:
+                # Greedy: the head stated each draft's chance; pick the window
+                # with the most expected tokens per millisecond for this block.
+                _clip_block_drafts(state, policy.window(cycle_conf) - 1)
+            else:
+                # Sampled: causal left-to-right stopping rule where conf[i]
+                # depends only on (h_main, d_0..d_{i-1}) and is independent of
+                # sampled d_i, preserving exact speculative rejection sampling.
+                _clip_block_drafts(state, policy.causal_window(cycle_conf) - 1)
         elif not state.copy_drafts:
-            # Sampled (and confidence-free) rounds choose k strictly from prior
-            # committed history so rejection sampling stays exact and no pre-verify
-            # .tolist() stalls target graph submission.
+            # Confidence-free fallback chooses k strictly from prior history.
             cycle_conf = None
             pol_k = policy.choose(
                 drafter_k=min(drafter.depth, int(state.depth or drafter.depth)),
@@ -5370,6 +5374,7 @@ def _run_verify_cycle_chain(
                 conf=cycle_conf,
                 # A lookup window whose block was drafted ahead paid for it too.
                 drafted=cycle_lookup_drafted if copy_cycle else k > 0,
+                sampled_conf=not is_greedy,
             )
         if seed is not None:
             mx.random.seed(seed)

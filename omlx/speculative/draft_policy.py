@@ -45,9 +45,10 @@ MAX_ROWS = 16
 K_MAX = MAX_ROWS - 1
 
 # The shape of a round's cost by window size, relative to one row, used until
-# sizes are measured (measured on Apple M5 Pro with fused packed MoE).
-_SHAPE = (0.0, 1.0, 1.20, 1.40, 1.59, 1.78, 2.05, 2.22, 2.38)
-_SHAPE = _SHAPE + tuple(2.38 + 0.18 * i for i in range(1, MAX_ROWS - 7))
+# sizes are measured (measured on real code tokens on Apple M5 Pro with fused
+# packed MoE for L<=9 and M5 NAX MoE for L>=10).
+_SHAPE = (0.0, 1.0, 1.20, 1.42, 1.68, 1.92, 2.16, 2.38, 2.58, 2.80, 2.98)
+_SHAPE = _SHAPE + tuple(2.98 + 0.10 * i for i in range(1, MAX_ROWS - 9))
 _SCALE_ALPHA = 0.2
 _COST_ALPHA = 0.1
 # A size's first rounds start from what the other sizes imply, worth this many
@@ -236,6 +237,8 @@ class DraftPolicy:
         self._lookup_bad = [0.0] * len(_LOOKUP_PRIOR)
         self._chance_ok = [0.0] * (len(_CHANCE_EDGES) + 1)
         self._chance_n = [0.0] * (len(_CHANCE_EDGES) + 1)
+        self._s_chance_ok = [0.0] * (len(_CHANCE_EDGES) + 1)
+        self._s_chance_n = [0.0] * (len(_CHANCE_EDGES) + 1)
         self._plain_rounds = 0
         self._drafting = False
 
@@ -257,6 +260,14 @@ class DraftPolicy:
         c = min(1.0, max(0.0, float(chance)))
         return (self._chance_ok[b] + _CHANCE_PRIOR_N * c) / (
             self._chance_n[b] + _CHANCE_PRIOR_N
+        )
+
+    def sampled_chance_rate(self, chance: float) -> float:
+        """Calibrated acceptance rate for sampled-mode F_i-measurable chances."""
+        b = _chance_bin(chance)
+        c = min(1.0, max(0.0, float(chance)))
+        return (self._s_chance_ok[b] + _CHANCE_PRIOR_N * c) / (
+            self._s_chance_n[b] + _CHANCE_PRIOR_N
         )
 
     def cost_ms(self, rows: int, drafted: bool = False) -> float:
@@ -404,6 +415,44 @@ class DraftPolicy:
         n = len(conf) if n is None else min(int(n), len(conf))
         return 1 + self.choose(drafter_k=n, conf=conf, drafted=True).k
 
+    def causal_window(self, conf: Sequence[float], n: Optional[int] = None) -> int:
+        """Causal left-to-right stopping window for exact sampled verification.
+
+        Decides whether to include draft ``i`` using only ``conf[:i + 1]`` and
+        historical cost/calibration state. Because ``conf[i]`` depends only on
+        ``(h_main, d_0, ..., d_{i-1})`` (independent of sampled ``d_i``), each
+        event ``{k >= i + 1}`` is F_i-measurable, preserving exact speculative
+        rejection sampling while adapting verify depth per block.
+        """
+        n = len(conf) if n is None else min(int(n), len(conf))
+        n = max(0, min(n, self.max_drafts))
+        if n == 0:
+            return 1
+        costs = self._costs
+        sunk = costs.draft_ms()
+        best_expected = 1.0
+        best_rate = 1.0 / (costs.verify_ms(1) + sunk)
+        if not self._drafting:
+            best_rate *= 1.0 + self.min_gain
+        surv = 1.0
+        k = 0
+        for i in range(n):
+            p_i = self.sampled_chance_rate(conf[i])
+            surv *= p_i
+            next_expected = best_expected + surv
+            next_rate = next_expected / (costs.verify_ms(i + 2) + sunk)
+            if next_rate >= best_rate or (
+                costs.unmeasured(i + 2) and p_i >= _PROBE_RATE
+            ):
+                k = i + 1
+                best_expected = next_expected
+                best_rate = next_rate
+            else:
+                break
+        if k == 0 and self._plain_rounds >= _REPROBE:
+            k = 1
+        return 1 + k
+
     # --- learning --------------------------------------------------------
 
     def observe(
@@ -414,6 +463,7 @@ class DraftPolicy:
         *,
         conf: Optional[Sequence[float]] = None,
         drafted: Optional[bool] = None,
+        sampled_conf: bool = False,
     ) -> None:
         """After the round: ``accepted`` of the ``choice.k`` drafts matched (a
         prefix), in ``round_ms`` (None: not a clean sample of this window).
@@ -442,13 +492,15 @@ class DraftPolicy:
         # `accepted` (if the window had it) was not; the rest were never tested.
         tested = min(k, accepted + 1)
         position = self._position
+        c_ok = self._s_chance_ok if sampled_conf else self._chance_ok
+        c_n = self._s_chance_n if sampled_conf else self._chance_n
         for i in range(tested):
             hit = 1.0 if i < accepted else 0.0
             position[i] += _POSITION_ALPHA * (hit - position[i])
             if conf is not None and i < len(conf):
                 b = _chance_bin(conf[i])
-                self._chance_ok[b] = _CHANCE_DECAY * self._chance_ok[b] + hit
-                self._chance_n[b] = _CHANCE_DECAY * self._chance_n[b] + 1.0
+                c_ok[b] = _CHANCE_DECAY * c_ok[b] + hit
+                c_n[b] = _CHANCE_DECAY * c_n[b] + 1.0
         if accepted == k:
             # The positions past the window were never tested: without this
             # they keep their prior and the window can never grow.
