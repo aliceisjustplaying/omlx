@@ -14,6 +14,271 @@ _MASK_BUDGET = 1 << 29
 
 _ATTN_RES_TG = 256
 _attn_res_kernels: dict = {}
+_attn_res_fused_kernels: dict = {}
+
+
+def _row0_view(a: mx.array) -> mx.array:
+    """Return ``a[:1]`` when it provably aliases ``a``'s buffer at offset 0.
+
+    MLX counts each bound input array's full byte size against its 50 MB
+    per-command-buffer cap, so binding stacked expert weights or lm_head
+    fragments every forward into ~100+ command buffers. Custom kernels that
+    index from buffer offset 0 can safely bind this 1-row alias while the
+    owning module keeps the full parameter alive.
+    """
+    if a is None or a.ndim < 2 or a.shape[0] <= 1:
+        return a
+    import numpy as np
+
+    view = a[:1]
+    mx.eval(view)
+    u8_whole = a.view(mx.uint8)
+    u8_first = view.view(mx.uint8)
+    mx.eval(u8_whole, u8_first)
+    mv_w, mv_f = memoryview(u8_whole), memoryview(u8_first)
+    addr_w = np.frombuffer(mv_w, dtype=np.uint8).ctypes.data
+    addr_f = np.frombuffer(mv_f, dtype=np.uint8).ctypes.data
+    if mv_w.c_contiguous and mv_f.c_contiguous and addr_f == addr_w:
+        return view
+    return a
+
+
+def prepare_moe_packed_views(mod):
+    """Prepare cached 1-expert offset-0 views outside ``mx.compile``."""
+    w = mod.weight
+    cached = getattr(mod, "_omlx_row0_views", None)
+    if cached is not None and cached[0] == id(w):
+        return cached[1], cached[2], cached[3]
+    wv = _row0_view(w)
+    sv = _row0_view(mod.scales)
+    b = getattr(mod, "biases", None)
+    bv = _row0_view(b) if b is not None else None
+    mod._omlx_row0_views = (id(w), wv, sv, bv)
+    return wv, sv, bv
+
+
+def _moe_packed_views(mod):
+    """Read cached 1-expert views (compile-safe; no eval/memoryview)."""
+    w = mod.weight
+    cached = getattr(mod, "_omlx_row0_views", None)
+    if cached is not None and cached[0] == id(w):
+        return cached[1], cached[2], cached[3]
+    return w, mod.scales, getattr(mod, "biases", None)
+
+
+def _attn_res_fused_kernel(
+    blocks: int, queries: int, with_norm: bool, emit_pn: bool
+):
+    """Fused unit-RMS(partial) + depth-residual softmax mix + optional RMSNorm."""
+    key = (blocks, queries, with_norm, emit_pn)
+    kernel = _attn_res_fused_kernels.get(key)
+    if kernel is not None:
+        return kernel
+    srcs = [f"b{i}" for i in range(blocks)]
+    b_loads = "\n".join(
+        f"        float s{i} = b{i}[base + h];" for i in range(blocks)
+    )
+    b_dots = "\n".join(
+        f"            acc[{i} * Q + qi] += s{i} * qv;" for i in range(blocks)
+    )
+    mix_terms = [f"w[{i} * Q + qi] * s{i}" for i in range(blocks)] + [
+        f"w[{blocks} * Q + qi] * sp"
+    ]
+    mix_expr = " + ".join(mix_terms)
+    pn_store = "        pn[base + h] = sp;" if emit_pn else ""
+
+    if with_norm:
+        nw_names = [f"nw{qi}" for qi in range(queries)]
+        out_names = [f"out{qi}" for qi in range(queries)]
+        v_sq_acc = "\n".join(
+            f"        {{\n"
+            f"            uint qi = {qi}u;\n"
+            f"            float mv = {mix_expr};\n"
+            f"            vreg[{qi}][it] = mv;\n"
+            f"            v_sq[{qi}] += mv * mv;\n"
+            f"        }}"
+            for qi in range(queries)
+        )
+        out_stores = "\n".join(
+            f"        out{qi}[base + h] = OT(vreg[{qi}][it] * inv_v[{qi}] * float(nw{qi}[h]));"
+            for qi in range(queries)
+        )
+        pass2 = f"""
+    float vreg[Q][MAX_IT];
+    float v_sq[Q];
+    for (uint qi = 0; qi < Q; ++qi) v_sq[qi] = 0.0f;
+    uint it = 0u;
+    for (uint h = tid; h < H; h += TG, ++it) {{
+{b_loads}
+        float sp = float(p[base + h]) * inv_p;
+{pn_store}
+{v_sq_acc}
+    }}
+    threadgroup float vred[Q][TG / 32];
+    for (uint qi = 0; qi < Q; ++qi) {{
+        float sv = simd_sum(v_sq[qi]);
+        if (lane == 0) vred[qi][sg] = sv;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_v[Q];
+    float eps_n = scale[1];
+    for (uint qi = 0; qi < Q; ++qi) {{
+        float t = 0.0f;
+        for (uint j = 0; j < TG / 32; ++j) t += vred[qi][j];
+        inv_v[qi] = metal::rsqrt(t / float(H) + eps_n);
+    }}
+    it = 0u;
+    for (uint h = tid; h < H; h += TG, ++it) {{
+{out_stores}
+    }}
+"""
+    else:
+        nw_names = []
+        out_names = ["out"]
+        pass2 = f"""
+    for (uint h = tid; h < H; h += TG) {{
+{b_loads}
+        float sp = float(p[base + h]) * inv_p;
+{pn_store}
+        for (uint qi = 0; qi < Q; ++qi) {{
+            out[((size_t)row * Q + qi) * H + h] = {mix_expr};
+        }}
+    }}
+"""
+    if emit_pn:
+        out_names = [*out_names, "pn"]
+
+    source = f"""
+    constexpr uint NS = {blocks + 1};
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    size_t base = (size_t)row * H;
+    float acc[NS * Q];
+    for (uint i = 0; i < NS * Q; ++i) acc[i] = 0.0f;
+    float p_sq = 0.0f;
+    for (uint h = tid; h < H; h += TG) {{
+{b_loads}
+        float pv = float(p[base + h]);
+        p_sq += pv * pv;
+        for (uint qi = 0; qi < Q; ++qi) {{
+            float qv = query[qi * H + h];
+{b_dots}
+            acc[{blocks} * Q + qi] += pv * qv;
+        }}
+    }}
+    threadgroup float red[NS * Q + 1][TG / 32];
+    for (uint i = 0; i < NS * Q; ++i) {{
+        float v = simd_sum(acc[i]);
+        if (lane == 0) red[i][sg] = v;
+    }}
+    {{
+        float ps = simd_sum(p_sq);
+        if (lane == 0) red[NS * Q][sg] = ps;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ptot = 0.0f;
+    for (uint j = 0; j < TG / 32; ++j) ptot += red[NS * Q][j];
+    float inv_p = metal::rsqrt(ptot / float(H) + 1e-6f);
+    float sc = scale[0];
+    float w[NS * Q];
+    for (uint i = 0; i < NS * Q; ++i) {{
+        float t = 0.0f;
+        for (uint j = 0; j < TG / 32; ++j) t += red[i][j];
+        if (i >= {blocks} * Q) t *= inv_p;
+        w[i] = t * sc;
+    }}
+    for (uint qi = 0; qi < Q; ++qi) {{
+        float m = -INFINITY;
+        for (uint n = 0; n < NS; ++n) m = max(m, w[n * Q + qi]);
+        float z = 0.0f;
+        for (uint n = 0; n < NS; ++n) {{
+            w[n * Q + qi] = metal::exp(w[n * Q + qi] - m);
+            z += w[n * Q + qi];
+        }}
+        for (uint n = 0; n < NS; ++n) w[n * Q + qi] /= z;
+    }}
+{pass2}
+"""
+    kernel = mx.fast.metal_kernel(
+        name=f"omlx_inkling2_attn_res_f_{blocks}_{queries}_{int(with_norm)}_{int(emit_pn)}",
+        input_names=[*srcs, "p", "query", "scale", *nw_names],
+        output_names=out_names,
+        source=source,
+    )
+    _attn_res_fused_kernels[key] = kernel
+    return kernel
+
+
+def attn_res_mix_raw(
+    blocks: list,
+    partial: mx.array,
+    query: mx.array,
+    scale_eps: mx.array,
+    *,
+    norm_weights: tuple[mx.array, ...] | None = None,
+    out_dtype=None,
+    emit_partial_n: bool = False,
+):
+    """Fused unit-RMS(partial) + attn_res_mix (+ optional RMSNorm + cast).
+
+    When ``norm_weights`` is provided, returns ``(out0, ...)`` (or ``out0`` when
+    Q=1) in ``out_dtype`` (plus ``partial_n`` if ``emit_partial_n``). Otherwise
+    returns FP32 ``[B, L, Q, H]`` (plus ``partial_n`` if ``emit_partial_n``).
+    """
+    b, length, hidden = partial.shape
+    nq = query.shape[0]
+    rows = b * length
+    with_norm = norm_weights is not None
+    max_it = (hidden + _ATTN_RES_TG - 1) // _ATTN_RES_TG
+    if (
+        mx.default_device() != mx.gpu
+        or (with_norm and max_it > 16)
+    ):
+        pf = partial.astype(mx.float32)
+        pn = pf * mx.rsqrt(mx.mean(pf * pf, axis=-1, keepdims=True) + 1e-6)
+        mixed = attn_res_mix(blocks, pn, query, float(scale_eps[0].item()))
+        if with_norm:
+            eps_n = float(scale_eps[1].item())
+            dt = partial.dtype if out_dtype is None else out_dtype
+            outs = tuple(
+                mx.fast.rms_norm(mixed[:, :, qi], norm_weights[qi], eps_n).astype(dt)
+                for qi in range(nq)
+            )
+            res = outs[0] if nq == 1 else outs
+        else:
+            res = mixed
+        return (res, pn) if emit_partial_n else res
+
+    kernel = _attn_res_fused_kernel(len(blocks), nq, with_norm, emit_partial_n)
+    inputs = [*blocks, partial, query, scale_eps]
+    template = [("H", hidden), ("Q", nq), ("TG", _ATTN_RES_TG)]
+    if with_norm:
+        dt = partial.dtype if out_dtype is None else out_dtype
+        inputs.extend(norm_weights)
+        template.extend([("MAX_IT", max_it), ("OT", dt)])
+        out_shapes = [(b, length, hidden)] * nq
+        out_dtypes = [dt] * nq
+    else:
+        out_shapes = [(b, length, nq, hidden)]
+        out_dtypes = [mx.float32]
+    if emit_partial_n:
+        out_shapes.append((b, length, hidden))
+        out_dtypes.append(mx.float32)
+    outs = kernel(
+        inputs=inputs,
+        template=template,
+        grid=(rows * _ATTN_RES_TG, 1, 1),
+        threadgroup=(_ATTN_RES_TG, 1, 1),
+        output_shapes=out_shapes,
+        output_dtypes=out_dtypes,
+    )
+    if emit_partial_n:
+        pn = outs[-1]
+        main = outs[0] if (not with_norm or nq == 1) else tuple(outs[:-1])
+        return main, pn
+    return outs[0] if (not with_norm or nq == 1) else tuple(outs)
 
 
 def _attn_res_kernel(blocks: int, queries: int):
@@ -1714,18 +1979,23 @@ _STATIC_CONV4_SOURCE = """
     uint bl = idx / C;
     uint l = bl % L;
     uint b = bl / L;
-    const device float* st = state + (size_t)b * 3 * C;
-    const device T* xb = x + (size_t)b * L * C;
-    const device WT* wp = w + (size_t)c * 4;
-    float x0 = (l >= 3) ? float(xb[(size_t)(l - 3) * C + c]) : st[(size_t)l * C + c];
-    float x1 = (l >= 2) ? float(xb[(size_t)(l - 2) * C + c]) : st[(size_t)(l + 1) * C + c];
-    float x2 = (l >= 1) ? float(xb[(size_t)(l - 1) * C + c]) : st[(size_t)(l + 2) * C + c];
-    float x3 = float(xb[(size_t)l * C + c]);
-    float conv = float(wp[0]) * x0 + float(wp[1]) * x1
-        + float(wp[2]) * x2 + float(wp[3]) * x3;
+    size_t ss0 = state_strides[0], ss1 = state_strides[1], ss2 = state_strides[2];
+    const device float* st = state + (size_t)b * ss0 + (size_t)c * ss2;
+    size_t xs0 = x_strides[0], xs1 = x_strides[1], xs2 = x_strides[2];
+    const device T* xb = x + (size_t)b * xs0 + (size_t)c * xs2;
+    size_t ws0 = w_strides[0], ws1 = w_strides[1];
+    const device WT* wp = w + (size_t)c * ws0;
+    float x0 = (l >= 3) ? float(xb[(size_t)(l - 3) * xs1]) : st[(size_t)l * ss1];
+    float x1 = (l >= 2) ? float(xb[(size_t)(l - 2) * xs1]) : st[(size_t)(l + 1) * ss1];
+    float x2 = (l >= 1) ? float(xb[(size_t)(l - 1) * xs1]) : st[(size_t)(l + 2) * ss1];
+    float x3 = float(xb[(size_t)l * xs1]);
+    float conv = float(wp[0]) * x0 + float(wp[ws1]) * x1
+        + float(wp[2 * ws1]) * x2 + float(wp[3 * ws1]) * x3;
     float y = float(T((float(WT(conv)) + x3) * scale[0]));
     if (HAS_RES) {
-        out[idx] = OT(float(res[idx]) + y);
+        size_t roff = (size_t)b * res_strides[0] + (size_t)l * res_strides[1]
+            + (size_t)c * res_strides[2];
+        out[idx] = OT(float(res[roff]) + y);
     } else {
         out[idx] = OT(y);
     }
@@ -1736,11 +2006,11 @@ _STATIC_CONV4_SOURCE = """
     } else if (l == L - 1) {
         device float* nst = next_state + (size_t)b * 3 * C;
         if (L == 1) {
-            nst[0 * C + c] = st[1 * C + c];
-            nst[1 * C + c] = st[2 * C + c];
+            nst[0 * C + c] = st[1 * ss1];
+            nst[1 * C + c] = st[2 * ss1];
             nst[2 * C + c] = x3;
         } else {
-            nst[0 * C + c] = st[2 * C + c];
+            nst[0 * C + c] = st[2 * ss1];
             nst[1 * C + c] = x2;
             nst[2 * C + c] = x3;
         }
@@ -1844,6 +2114,7 @@ def static_conv4_fused(
             input_names=["x", "w", "state", "scale", "res"],
             output_names=["out", "next_state"],
             source=_STATIC_CONV4_SOURCE,
+            ensure_row_contiguous=False,
         )
     b, length, channels = x.shape
     has_res = 1 if residual is not None else 0
@@ -2326,6 +2597,8 @@ def moe_fused_packed(
     inter = w13.weight.shape[1] // 2
     idx_f = inds.reshape(-1).astype(mx.uint32)
     wts_f = weights.reshape(-1).astype(mx.float32)
+    w13_w, w13_s, w13_b = _moe_packed_views(w13)
+    w2_w, w2_s, w2_b = _moe_packed_views(w2)
     if w13.mode == "nvfp4":
         if rows >= 3 and w13.weight.shape[0] <= 128:
             if _moe_plan16_kernel is None:
@@ -2364,7 +2637,7 @@ def moe_fused_packed(
                 output_dtypes=[mx.uint32],
             )[0]
             act = _ups_nvfp4_grp_kernel(
-                inputs=[x, w13.weight, w13.scales, w13.global_scale, up_params, plan],
+                inputs=[x, w13_w, w13_s, w13.global_scale, up_params, plan],
                 template=[("T", x.dtype), ("K", hidden), ("I", inter), ("KSEL", top_k)],
                 grid=(32, inter, rows * top_k),
                 threadgroup=(32, 2, 1),
@@ -2372,7 +2645,7 @@ def moe_fused_packed(
                 output_dtypes=[x.dtype],
             )[0]
             yslot = _downs_nvfp4_grp_kernel(
-                inputs=[act, w2.weight, w2.scales, w2.global_scale, wts_f, dn_params, plan],
+                inputs=[act, w2_w, w2_s, w2.global_scale, wts_f, dn_params, plan],
                 template=[("T", x.dtype), ("I", inter), ("D", hidden)],
                 grid=(32, hidden, rows * top_k),
                 threadgroup=(32, 2, 1),
@@ -2403,7 +2676,7 @@ def moe_fused_packed(
                 header=_PACKED_MOE_HEADER,
             )
         act = _ups_nvfp4_kernel(
-            inputs=[x, w13.weight, w13.scales, idx_f, w13.global_scale, up_params],
+            inputs=[x, w13_w, w13_s, idx_f, w13.global_scale, up_params],
             template=[("T", x.dtype), ("K", hidden), ("I", inter), ("KSEL", top_k)],
             grid=(32, inter, rows * top_k),
             threadgroup=(32, 2, 1),
@@ -2411,7 +2684,7 @@ def moe_fused_packed(
             output_dtypes=[x.dtype],
         )[0]
         return _downs_nvfp4_kernel(
-            inputs=[act, w2.weight, w2.scales, idx_f, w2.global_scale, wts_f, dn_params],
+            inputs=[act, w2_w, w2_s, idx_f, w2.global_scale, wts_f, dn_params],
             template=[("T", x.dtype), ("D", hidden), ("I", inter), ("KSEL", top_k)],
             grid=(32, top_k, rows * hidden),
             threadgroup=(32, top_k, 1),
@@ -2434,7 +2707,7 @@ def moe_fused_packed(
             header=_PACKED_MOE_HEADER,
         )
     act = _ups_aff4_kernel(
-        inputs=[x, w13.weight, w13.scales, w13.biases, idx_f, up_params],
+        inputs=[x, w13_w, w13_s, w13_b, idx_f, up_params],
         template=[
             ("T", x.dtype),
             ("S", w13.scales.dtype),
@@ -2449,7 +2722,7 @@ def moe_fused_packed(
         output_dtypes=[x.dtype],
     )[0]
     return _downs_aff4_kernel(
-        inputs=[act, w2.weight, w2.scales, w2.biases, idx_f, wts_f],
+        inputs=[act, w2_w, w2_s, w2_b, idx_f, wts_f],
         template=[
             ("T", x.dtype),
             ("S", w2.scales.dtype),
@@ -3255,6 +3528,279 @@ _NAX_FLASH_BANDED_SOURCE = r"""
 
 _nax_attn_supported: bool | None = None
 _nax_flash_banded_kernel = None
+_nax_flash_slab_kernel = None
+_nax_flash_tail_kernel = None
+
+_NAX_FLASH_SLAB_SOURCE = r"""
+    constexpr uint AQ = 32u;
+    constexpr uint AK = 64u;
+    const uint h = threadgroup_position_in_grid.x;
+    const uint tgp_q = threadgroup_position_in_grid.y;
+    const uint b = threadgroup_position_in_grid.z;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+
+    const uint L = uint(DIMS[0]);
+    const uint S_LEN = uint(DIMS[1]);
+    const uint k_lo = uint(DIMS[2]);
+    const uint k_hi = uint(DIMS[3]);
+    const uint t0 = tgp_q * AQ;
+    if (t0 >= L) return;
+    const uint nq = min(AQ, L - t0);
+    const uint hk = h / (HQ / HKV);
+    const float sc = SCALE[0];
+
+    threadgroup float ss[AQ * AK];
+    threadgroup bfloat sp[AQ * AK];
+    threadgroup float sr[AQ];
+
+    const device bfloat* q_ptr = Q + ((size_t(b) * HQ + h) * L + t0) * D;
+    const device bfloat* kbase = K + (size_t(b) * HKV + hk) * S_LEN * D;
+    const device bfloat* vbase = V + (size_t(b) * HKV + hk) * S_LEN * D;
+
+    auto tq = tensor((device bfloat*)q_ptr, dextents<int32_t, 2>(D, int(nq)), array<int, 2>({1, D}));
+    auto ts = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(ss, dextents<int32_t, 2>(AK, AQ));
+    auto tp = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sp, dextents<int32_t, 2>(AK, AQ));
+    auto tv0 = tensor((device bfloat*)vbase, dextents<int32_t, 2>(D, AK), array<int, 2>({1, D}));
+
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, AK, D, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply), execution_simdgroups<8>> mm_qk;
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, D, AK, false, false, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<8>> mm_pv;
+
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+    ushort cd[4], cr[4];
+    for (short q = 0; q < 4; ++q) {
+        const auto ix = co.get_multidimensional_index(4 * q);
+        cd[q] = ix[0];
+        cr[q] = ix[1];
+    }
+
+    const size_t ml_base = (size_t(b) * HQ + h) * L + t0;
+    const size_t o_base = ((size_t(b) * HQ + h) * L + t0) * D;
+
+    float M[4], Sm[4];
+    if (IS_FIRST) {
+        for (short i = 0; i < 16; ++i) co[i] = 0.0f;
+        for (short jj = 0; jj < 4; ++jj) {
+            const uint j = jj * 8u + sg;
+            M[jj] = (j < nq) ? SINK[((size_t(b) * L + (t0 + j)) * HQ) + h] : 0.0f;
+            Sm[jj] = 1.0f;
+        }
+    } else {
+        for (short q = 0; q < 4; ++q) {
+            const uint row = cr[q];
+            if (row < nq) {
+                const size_t oo = o_base + size_t(row) * D + cd[q];
+                co[4 * q] = O_IN[oo];
+                co[4 * q + 1] = O_IN[oo + 1];
+                co[4 * q + 2] = O_IN[oo + 2];
+                co[4 * q + 3] = O_IN[oo + 3];
+            } else {
+                co[4 * q] = 0.0f; co[4 * q + 1] = 0.0f; co[4 * q + 2] = 0.0f; co[4 * q + 3] = 0.0f;
+            }
+        }
+        for (short jj = 0; jj < 4; ++jj) {
+            const uint j = jj * 8u + sg;
+            M[jj] = (j < nq) ? M_IN[ml_base + j] : 0.0f;
+            Sm[jj] = (j < nq) ? L_IN[ml_base + j] : 1.0f;
+        }
+    }
+
+    for (uint kc = k_lo; kc < k_hi; kc += AK) {
+        const int nk = int(min(AK, k_hi - kc));
+        {
+            auto tk = tensor((device bfloat*)(kbase + size_t(kc) * D), dextents<int32_t, 2>(D, nk), array<int, 2>({1, D}));
+            auto cs = mm_qk.template get_destination_cooperative_tensor<decltype(tq), decltype(tk), float>();
+            mm_qk.run(tq, tk, cs);
+            cs.store(ts);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short jj = 0; jj < 4; ++jj) {
+            const uint j = jj * 8u + sg;
+            float s0 = (j < nq && int(lane) < nk) ? (ss[j * AK + lane] * sc) : -INFINITY;
+            float s1 = (j < nq && int(32u + lane) < nk) ? (ss[j * AK + 32u + lane] * sc) : -INFINITY;
+            const float m = simd_max(max(M[jj], max(s0, s1)));
+            const float ms = exp(M[jj] - m);
+            M[jj] = m;
+            const float p0 = exp(s0 - m);
+            const float p1 = exp(s1 - m);
+            sp[j * AK + lane] = bfloat(p0);
+            sp[j * AK + 32u + lane] = bfloat(p1);
+            Sm[jj] = Sm[jj] * ms + simd_sum(p0 + p1);
+            if (lane == 0u) sr[j] = ms;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            const float r0 = sr[cr[0]], r1 = sr[cr[1]], r2 = sr[cr[2]], r3 = sr[cr[3]];
+            co[0] *= r0; co[1] *= r0; co[2] *= r0; co[3] *= r0;
+            co[4] *= r1; co[5] *= r1; co[6] *= r1; co[7] *= r1;
+            co[8] *= r2; co[9] *= r2; co[10] *= r2; co[11] *= r2;
+            co[12] *= r3; co[13] *= r3; co[14] *= r3; co[15] *= r3;
+        }
+        auto tv = tensor((device bfloat*)(vbase + size_t(kc) * D), dextents<int32_t, 2>(D, nk), array<int, 2>({1, D}));
+        mm_pv.run(tp, tv, co);
+    }
+
+    for (short jj = 0; jj < 4; ++jj) {
+        const uint j = jj * 8u + sg;
+        if (lane == 0u && j < nq) {
+            M_OUT[ml_base + j] = M[jj];
+            L_OUT[ml_base + j] = Sm[jj];
+        }
+    }
+    for (short q = 0; q < 4; ++q) {
+        const uint row = cr[q];
+        if (row < nq) {
+            *(device float4*)(O_OUT + o_base + size_t(row) * D + cd[q]) =
+                float4(co[4 * q], co[4 * q + 1], co[4 * q + 2], co[4 * q + 3]);
+        }
+    }
+"""
+
+_NAX_FLASH_TAIL_SOURCE = r"""
+    constexpr uint AQ = 32u;
+    constexpr uint AK = 64u;
+    const uint tgp_q = threadgroup_position_in_grid.x;
+    const uint h = threadgroup_position_in_grid.y;
+    const uint b = threadgroup_position_in_grid.z;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+
+    const uint L = uint(DIMS[0]);
+    const uint S_LEN = uint(DIMS[1]);
+    const uint tail_lo = uint(DIMS[2]);
+    const uint t0 = tgp_q * AQ;
+    if (t0 >= L) return;
+    const uint nq = min(AQ, L - t0);
+    const uint hk = h / (HQ / HKV);
+    const float sc = SCALE[0];
+
+    threadgroup float ss[AQ * AK];
+    threadgroup bfloat sp[AQ * AK];
+    threadgroup float sr[AQ];
+
+    const device bfloat* q_ptr = Q + ((size_t(b) * HQ + h) * L + t0) * D;
+    const device bfloat* kbase = K + (size_t(b) * HKV + hk) * S_LEN * D;
+    const device bfloat* vbase = V + (size_t(b) * HKV + hk) * S_LEN * D;
+    const device bfloat* rel_b = REL + (size_t(b) * L + t0) * HQ * R + h * R;
+
+    auto tq = tensor((device bfloat*)q_ptr, dextents<int32_t, 2>(D, int(nq)), array<int, 2>({1, D}));
+    auto ts = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(ss, dextents<int32_t, 2>(AK, AQ));
+    auto tp = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sp, dextents<int32_t, 2>(AK, AQ));
+    auto tv0 = tensor((device bfloat*)vbase, dextents<int32_t, 2>(D, AK), array<int, 2>({1, D}));
+
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, AK, D, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply), execution_simdgroups<8>> mm_qk;
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, D, AK, false, false, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<8>> mm_pv;
+
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+    ushort cd[4], cr[4];
+    for (short q = 0; q < 4; ++q) {
+        const auto ix = co.get_multidimensional_index(4 * q);
+        cd[q] = ix[0];
+        cr[q] = ix[1];
+    }
+
+    const size_t ml_base = (size_t(b) * HQ + h) * L + t0;
+    const size_t o_base = ((size_t(b) * HQ + h) * L + t0) * D;
+    for (short q = 0; q < 4; ++q) {
+        const uint row = cr[q];
+        if (row < nq) {
+            const size_t oo = o_base + size_t(row) * D + cd[q];
+            co[4 * q] = O_IN[oo];
+            co[4 * q + 1] = O_IN[oo + 1];
+            co[4 * q + 2] = O_IN[oo + 2];
+            co[4 * q + 3] = O_IN[oo + 3];
+        } else {
+            co[4 * q] = 0.0f; co[4 * q + 1] = 0.0f; co[4 * q + 2] = 0.0f; co[4 * q + 3] = 0.0f;
+        }
+    }
+    float M[4], Sm[4];
+    for (short jj = 0; jj < 4; ++jj) {
+        const uint j = jj * 8u + sg;
+        M[jj] = (j < nq) ? M_IN[ml_base + j] : 0.0f;
+        Sm[jj] = (j < nq) ? L_IN[ml_base + j] : 1.0f;
+    }
+
+    const uint pfirst = S_LEN - L + t0;
+    const uint plast = pfirst + nq - 1u;
+    for (uint kc = tail_lo; kc <= plast; kc += AK) {
+        const int nk = int(min(AK, S_LEN - kc));
+        {
+            auto tk = tensor((device bfloat*)(kbase + size_t(kc) * D), dextents<int32_t, 2>(D, nk), array<int, 2>({1, D}));
+            auto cs = mm_qk.template get_destination_cooperative_tensor<decltype(tq), decltype(tk), float>();
+            mm_qk.run(tq, tk, cs);
+            cs.store(ts);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int D0 = int(pfirst) - int(kc);
+        const bool fast = (nq == AQ) && (D0 >= int(AK - 1u))
+            && (D0 - int(AK - 1u) >= R || D0 + int(AQ - 1u) < R);
+        const bool has_rel = (D0 - int(AK - 1u)) < R;
+        for (short jj = 0; jj < 4; ++jj) {
+            const uint j = jj * 8u + sg;
+            float s0 = ss[j * AK + lane] * sc;
+            float s1 = ss[j * AK + 32u + lane] * sc;
+            if (fast) {
+                if (has_rel) {
+                    const uint d0 = uint(D0 + int(j) - int(lane));
+                    const device bfloat* rj = rel_b + size_t(j) * HQ * R;
+                    s0 += float(rj[d0]);
+                    s1 += float(rj[d0 - 32u]);
+                }
+            } else {
+                const int d0 = D0 + int(j) - int(lane);
+                const int d1 = d0 - 32;
+                const bool v0 = (j < nq) && (d0 >= 0);
+                const bool v1 = (j < nq) && (d1 >= 0);
+                if (v0 && d0 < R) s0 += float(rel_b[size_t(j) * HQ * R + uint(d0)]);
+                if (v1 && d1 < R) s1 += float(rel_b[size_t(j) * HQ * R + uint(d1)]);
+                if (!v0) s0 = -INFINITY;
+                if (!v1) s1 = -INFINITY;
+            }
+            const float m = simd_max(max(M[jj], max(s0, s1)));
+            const float ms = exp(M[jj] - m);
+            M[jj] = m;
+            const float p0 = exp(s0 - m);
+            const float p1 = exp(s1 - m);
+            sp[j * AK + lane] = bfloat(p0);
+            sp[j * AK + 32u + lane] = bfloat(p1);
+            Sm[jj] = Sm[jj] * ms + simd_sum(p0 + p1);
+            if (lane == 0u) sr[j] = ms;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            const float r0 = sr[cr[0]], r1 = sr[cr[1]], r2 = sr[cr[2]], r3 = sr[cr[3]];
+            co[0] *= r0; co[1] *= r0; co[2] *= r0; co[3] *= r0;
+            co[4] *= r1; co[5] *= r1; co[6] *= r1; co[7] *= r1;
+            co[8] *= r2; co[9] *= r2; co[10] *= r2; co[11] *= r2;
+            co[12] *= r3; co[13] *= r3; co[14] *= r3; co[15] *= r3;
+        }
+        auto tv = tensor((device bfloat*)(vbase + size_t(kc) * D), dextents<int32_t, 2>(D, nk), array<int, 2>({1, D}));
+        mm_pv.run(tp, tv, co);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short jj = 0; jj < 4; ++jj) {
+        if (lane == 0u) sr[jj * 8u + sg] = 1.0f / Sm[jj];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device bfloat* out_b = OUT + (size_t(b) * L + t0) * HQ * D + h * D;
+    for (short q = 0; q < 4; ++q) {
+        const uint row = cr[q];
+        if (row < nq) {
+            const float4 v = float4(co[4 * q], co[4 * q + 1], co[4 * q + 2], co[4 * q + 3]) * sr[row];
+            *(device bfloat4*)(out_b + size_t(row) * HQ * D + cd[q]) = bfloat4(v);
+        }
+    }
+"""
 
 
 def can_use_nax_attn() -> bool:
@@ -3319,7 +3865,7 @@ def flash_banded_attention_nax(
     left_padding=None,
 ) -> mx.array:
     """M5 Metal 4 matmul2d banded-sink FlashAttention (BF16 or FP8 E4M3 K/V)."""
-    global _nax_flash_banded_kernel
+    global _nax_flash_banded_kernel, _nax_flash_slab_kernel, _nax_flash_tail_kernel
     if _nax_flash_banded_kernel is None:
         _nax_flash_banded_kernel = mx.fast.metal_kernel(
             name="omlx_inkling2_flash_banded_nax",
@@ -3330,6 +3876,7 @@ def flash_banded_attention_nax(
         )
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
+    r_ext = rel.shape[-1]
     lp = (
         left_padding.astype(mx.int32)
         if left_padding is not None
@@ -3344,27 +3891,71 @@ def flash_banded_attention_nax(
     if k.dtype == mx.uint8:
         k = fp8_e4m3_dequantize(k, mx.bfloat16)
         v = fp8_e4m3_dequantize(v, mx.bfloat16)
-    dims = mx.concatenate([mx.array([length, s], dtype=mx.int32), lp])
-    # For long full-attention contexts (>4K keys), sweep Q-tiles in Y per head so
-    # one KV head stays resident in M5 Pro's 24-32 MB SLC across all Q-tiles.
-    swap_grid = 1 if (not window and s > 4096) else 0
+
+    q_c = mx.contiguous(q)
+    k_c = mx.contiguous(k)
+    v_c = mx.contiguous(v)
+    rel_c = mx.contiguous(rel)
+    sink_c = mx.contiguous(sink.astype(mx.float32))
+    sc_arr = mx.array([scale], dtype=mx.float32)
     q_tiles = (length + 31) // 32
+
+    # At very long full-attention contexts (>32K keys), one BF16 KV head pair
+    # exceeds M5 Pro's SLC. Sweep old keys in 2K slabs (1 MB/KV head) across all
+    # query tiles, then finish the relative-bias + causal tail in one pass.
+    tail_lo = ((s - length - r_ext) // 64) * 64
+    if not window and left_padding is None and b == 1 and length >= 512 and s > 32768 and tail_lo >= 4096:
+        if _nax_flash_slab_kernel is None:
+            _nax_flash_slab_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_flash_slab_nax",
+                input_names=["Q", "K", "V", "SINK", "O_IN", "M_IN", "L_IN", "DIMS", "SCALE"],
+                output_names=["O_OUT", "M_OUT", "L_OUT"],
+                header=_NAX_MOE_HEADER,
+                source=_NAX_FLASH_SLAB_SOURCE,
+            )
+            _nax_flash_tail_kernel = mx.fast.metal_kernel(
+                name="omlx_inkling2_flash_tail_nax",
+                input_names=["Q", "K", "V", "REL", "O_IN", "M_IN", "L_IN", "DIMS", "SCALE"],
+                output_names=["OUT"],
+                header=_NAX_MOE_HEADER,
+                source=_NAX_FLASH_TAIL_SOURCE,
+            )
+        slab = 2048
+        o_acc = m_acc = l_acc = _dummy_f32()
+        first = 1
+        for k_lo in range(0, tail_lo, slab):
+            k_hi = min(tail_lo, k_lo + slab)
+            sdims = mx.array([length, s, k_lo, k_hi], dtype=mx.int32)
+            o_acc, m_acc, l_acc = _nax_flash_slab_kernel(
+                inputs=[q_c, k_c, v_c, sink_c, o_acc, m_acc, l_acc, sdims, sc_arr],
+                template=[("D", d), ("HQ", hq), ("HKV", hkv), ("IS_FIRST", first)],
+                grid=(hq * 256, q_tiles, b),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(b, hq, length, d), (b, hq, length), (b, hq, length)],
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
+            )
+            first = 0
+        tdims = mx.array([length, s, tail_lo], dtype=mx.int32)
+        out = _nax_flash_tail_kernel(
+            inputs=[q_c, k_c, v_c, rel_c, o_acc, m_acc, l_acc, tdims, sc_arr],
+            template=[("D", d), ("HQ", hq), ("HKV", hkv), ("R", r_ext)],
+            grid=(q_tiles * 256, hq, b),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(b, length, hq, d)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+        return out.transpose(0, 2, 1, 3)
+
+    dims = mx.concatenate([mx.array([length, s], dtype=mx.int32), lp])
+    swap_grid = 1 if (not window and s > 4096) else 0
     grid = (hq * 256, q_tiles, b) if swap_grid else (q_tiles * 256, hq, b)
     out = _nax_flash_banded_kernel(
-        inputs=[
-            mx.contiguous(q),
-            mx.contiguous(k),
-            mx.contiguous(v),
-            mx.contiguous(rel),
-            mx.contiguous(sink.astype(mx.float32)),
-            dims,
-            mx.array([scale], dtype=mx.float32),
-        ],
+        inputs=[q_c, k_c, v_c, rel_c, sink_c, dims, sc_arr],
         template=[
             ("D", d),
             ("HQ", hq),
             ("HKV", hkv),
-            ("R", rel.shape[-1]),
+            ("R", r_ext),
             ("WINDOW", int(window)),
             ("SWAP_GRID", swap_grid),
         ],
@@ -3423,7 +4014,12 @@ _FUSED_HEAD_PREP_SOURCE = r"""
         acc = simd_sum(acc);
         const float f = min(PR[0] / (metal::precise::sqrt(acc) + 1e-6f), 1.0f);
         for (uint j = 0u; j < PER; ++j) {
-            KO[dst_base + j] = T(xs[j] * f);
+            T v = T(xs[j] * f);
+            if (FP8_KV) {
+                KO[dst_base + j] = KVT(float_to_fp8_e4m3(float(v)));
+            } else {
+                KO[dst_base + j] = KVT(v);
+            }
         }
     } else if (slot < NH + 2u * NKV) {
         const uint h = slot - NH - NKV;
@@ -3439,7 +4035,12 @@ _FUSED_HEAD_PREP_SOURCE = r"""
         acc = simd_sum(acc);
         const float inv = metal::precise::rsqrt(acc / float(HD) + 1e-6f);
         for (uint j = 0u; j < PER; ++j) {
-            VO[dst_base + j] = T(xs[j] * inv);
+            T v = T(xs[j] * inv);
+            if (FP8_KV) {
+                VO[dst_base + j] = KVT(float_to_fp8_e4m3(float(v)));
+            } else {
+                VO[dst_base + j] = KVT(v);
+            }
         }
     } else {
         const uint h = slot - NH - 2u * NKV;
@@ -3497,8 +4098,9 @@ def fused_head_prep(
     n_kv: int,
     head_dim: int,
     d_rel: int,
+    fp8_kv: bool = False,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
-    """Fused L2-clip (q, k, r), unit-RMS (v), optional tau scale and head-major transpose."""
+    """Fused L2-clip (q, k, r), unit-RMS (v), optional tau scale, FP8 KV encode and head-major transpose."""
     global _fused_head_prep_kernel
     if _fused_head_prep_kernel is None:
         _fused_head_prep_kernel = mx.fast.metal_kernel(
@@ -3506,9 +4108,10 @@ def fused_head_prep(
             input_names=["QRAW", "KRAW", "VRAW", "RRAW", "QSCALE", "RSCALE", "PR", "TAU"],
             output_names=["QO", "KO", "VO", "RO"],
             source=_FUSED_HEAD_PREP_SOURCE,
+            header=_FP8_E4M3_HEADER,
             ensure_row_contiguous=False,
         )
-    b, length, _ = q.shape
+    b, length, _ = q.shape if n_heads > 0 else k.shape
     has_tau = 1 if tau is not None else 0
     if has_tau:
         tau_sb = 0 if tau.shape[0] == 1 else length
@@ -3516,6 +4119,7 @@ def fused_head_prep(
     else:
         tau_sb = 0
         tau_arr = _dummy_f32()
+    kv_dtype = mx.uint8 if fp8_kv else k.dtype
     slots = 2 * n_heads + 2 * n_kv
     return _fused_head_prep_kernel(
         inputs=[
@@ -3529,7 +4133,9 @@ def fused_head_prep(
             tau_arr,
         ],
         template=[
-            ("T", q.dtype),
+            ("T", q.dtype if n_heads > 0 else k.dtype),
+            ("KVT", kv_dtype),
+            ("FP8_KV", 1 if fp8_kv else 0),
             ("L", length),
             ("NH", n_heads),
             ("NKV", n_kv),
@@ -3541,12 +4147,17 @@ def fused_head_prep(
         grid=(32, b * length * slots, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[
-            (b, n_heads, length, head_dim),
-            (b, n_kv, length, head_dim),
-            (b, n_kv, length, head_dim),
-            (b, length, n_heads, d_rel),
+            (b, n_heads, length, head_dim) if n_heads > 0 else (1,),
+            (b, n_kv, length, head_dim) if n_kv > 0 else (1,),
+            (b, n_kv, length, head_dim) if n_kv > 0 else (1,),
+            (b, length, n_heads, d_rel) if n_heads > 0 else (1,),
         ],
-        output_dtypes=[q.dtype, k.dtype, v.dtype, r.dtype],
+        output_dtypes=[
+            q.dtype if n_heads > 0 else k.dtype,
+            kv_dtype,
+            kv_dtype,
+            r.dtype if n_heads > 0 else k.dtype,
+        ],
     )
 
 

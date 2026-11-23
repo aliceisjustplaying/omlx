@@ -624,6 +624,8 @@ class VLMModelAdapter(nn.Module):
         if self.model_type == "deepseek_v41":
             kwargs["_ced_prefill"] = True
             kwargs["next_prefill_tokens"] = next_prefill_tokens
+        elif self.model_type in ("inkling2", "inkling2_loop"):
+            kwargs["_omlx_prefill_trim"] = True
         return self(input_ids, cache=cache, **kwargs)
 
     def __call__(

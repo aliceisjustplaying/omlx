@@ -25,6 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from . import INKLING2_MODEL_TYPES
+from .kernels import _row0_view
 
 logger = logging.getLogger(__name__)
 
@@ -1585,6 +1586,18 @@ class Inkling2MarkovHead(nn.Module):
                     ]
                 )
             mx.eval(eval_list)
+            if self.screen_enabled:
+                self._head_sc_wq_v = _row0_view(self._head_sc_wq)
+                self._head_sc_sc_v = _row0_view(self._head_sc_sc)
+                self._fold_sc_wq_v = _row0_view(self._fold_sc_wq)
+                self._fold_sc_sc_v = _row0_view(self._fold_sc_sc)
+                self._head_wq_v = _row0_view(self._head_wq)
+                self._head_scales_v = _row0_view(self._head_scales)
+                self._head_biases_v = _row0_view(self._head_biases)
+                self._head_dense_v = _row0_view(self._head_dense)
+                self._fold_wq_v = _row0_view(self._fold_wq)
+                self._fold_scales_v = _row0_view(self._fold_scales)
+                self._fold_biases_v = _row0_view(self._fold_biases)
         else:
             self._fold_weight = folded
             self._fold_wq = self._fold_scales = self._fold_biases = None
@@ -1595,7 +1608,10 @@ class Inkling2MarkovHead(nn.Module):
         if not self.screen_enabled:
             raise RuntimeError("2-bit screened head is not initialized")
         return _dspark_head_base(
-            draft_hidden, self._head_sc_wq, self._head_sc_sc, self._screen_tiles
+            draft_hidden,
+            self._head_sc_wq_v,
+            self._head_sc_sc_v,
+            self._screen_tiles,
         )
 
     def _is_screened_base(self, base_logits: mx.array | None) -> bool:
@@ -1629,17 +1645,17 @@ class Inkling2MarkovHead(nn.Module):
                 lat_step=latent,
                 lat_f16=lat_f16,
                 approx_base=base_logits,
-                fold_sc_wq=self._fold_sc_wq,
-                fold_sc_sc=self._fold_sc_sc,
+                fold_sc_wq=self._fold_sc_wq_v,
+                fold_sc_sc=self._fold_sc_sc_v,
                 fold_bp=self._fold_bp,
-                head_wq=self._head_wq,
-                head_s=self._head_scales,
-                head_b=self._head_biases,
-                head_dense=self._head_dense,
+                head_wq=self._head_wq_v,
+                head_s=self._head_scales_v,
+                head_b=self._head_biases_v,
+                head_dense=self._head_dense_v,
                 head_gs=self._head_gs,
-                fold_wq=self._fold_wq,
-                fold_s=self._fold_scales,
-                fold_b=self._fold_biases,
+                fold_wq=self._fold_wq_v,
+                fold_s=self._fold_scales_v,
+                fold_b=self._fold_biases_v,
                 fold_bias=self._fold_bias,
                 v_unpad=self._unpadded_vocab_size,
                 t_tiles=self._screen_tiles,
@@ -1667,17 +1683,17 @@ class Inkling2MarkovHead(nn.Module):
             lat_step=latent,
             lat_f16=lat_f16,
             approx_base=base_logits,
-            fold_sc_wq=self._fold_sc_wq,
-            fold_sc_sc=self._fold_sc_sc,
+            fold_sc_wq=self._fold_sc_wq_v,
+            fold_sc_sc=self._fold_sc_sc_v,
             fold_bp=self._fold_bp,
-            head_wq=self._head_wq,
-            head_s=self._head_scales,
-            head_b=self._head_biases,
-            head_dense=self._head_dense,
+            head_wq=self._head_wq_v,
+            head_s=self._head_scales_v,
+            head_b=self._head_biases_v,
+            head_dense=self._head_dense_v,
             head_gs=self._head_gs,
-            fold_wq=self._fold_wq,
-            fold_s=self._fold_scales,
-            fold_b=self._fold_biases,
+            fold_wq=self._fold_wq_v,
+            fold_s=self._fold_scales_v,
+            fold_b=self._fold_biases_v,
             fold_bias=self._fold_bias,
             v_unpad=self._unpadded_vocab_size,
             t_tiles=self._screen_tiles,
@@ -1973,9 +1989,19 @@ def _make_inkling2_dspark_drafter_cls():
             super().adopt_predraft(state, count)
             if pg is not None:
                 uid = state.uid
+                row = self._rows.get(uid)
+                g_start = self._global_start.get(uid, 0)
+                committed_len = (
+                    max(0, int(row.fed) - int(g_start)) if row is not None else None
+                )
                 gmap = self._global_rows.setdefault(uid, {})
                 for layer_idx, (gk, gv, lengths) in pg.items():
-                    gmap[layer_idx] = [gk[0], gv[0], lengths[0]]
+                    vlen = (
+                        min(int(lengths[0]), committed_len)
+                        if committed_len is not None
+                        else int(lengths[0])
+                    )
+                    gmap[layer_idx] = [gk[0], gv[0], vlen]
             if pc is not None and pc[0] is not None:
                 n_keep = self._proposal_count(state)
                 state.draft_conf = pc[0][:n_keep]
@@ -2349,14 +2375,15 @@ def _make_inkling2_dspark_drafter_cls():
                     max_proposals = max(2, min(4, want + 1))
                     if max_proposals < draft_hidden.shape[1]:
                         draft_hidden = draft_hidden[:, :max_proposals]
-                elif can_screen_sampled:
-                    # Slice before prepare_block + screen_base: prose stays at 4 steps
-                    # while code/JSON climbs to 7 and holds across 1-2 cycle dips.
+                elif not greedy and can_screen_sampled:
+                    # Slice before prepare_block + screen_base to DraftPolicy's pre-draw
+                    # window (+1 upward headroom so policy.choose can climb without
+                    # stalling on post-draw confidence readbacks).
                     want_s = max(
-                        (int(getattr(state, "_peak_verified_k", 4) or 4) for state, *_ in rows),
-                        default=4,
+                        (int(getattr(state, "_policy_k", 3) or 3) for state, *_ in rows),
+                        default=3,
                     )
-                    max_proposals = max(4, min(7, want_s + 2))
+                    max_proposals = max(2, min(7, want_s + 1))
                     if max_proposals < draft_hidden.shape[1]:
                         draft_hidden = draft_hidden[:, :max_proposals]
                 elif commit:

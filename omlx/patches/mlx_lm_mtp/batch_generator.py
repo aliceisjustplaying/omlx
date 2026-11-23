@@ -4924,13 +4924,16 @@ def _run_verify_cycle_chain(
     own_forward = verify_result is None
     cycle_conf = None
     if drafter is not None and own_forward and policy is not None:
-        if not state.copy_drafts:
+        if is_greedy and not state.copy_drafts:
             cycle_conf = _stated_chances(state)
         if cycle_conf:
-            # The head stated each draft's chance: the window is the one with
-            # the most expected tokens per millisecond for this block.
+            # Greedy only: the head stated each draft's chance; the window is the
+            # one with the most expected tokens per millisecond for this block.
             _clip_block_drafts(state, policy.window(cycle_conf) - 1)
         elif not state.copy_drafts:
+            # Sampled (and confidence-free) rounds choose k strictly from prior
+            # committed history so rejection sampling stays exact and no pre-verify
+            # .tolist() stalls target graph submission.
             cycle_conf = None
             pol_k = policy.choose(
                 drafter_k=min(drafter.depth, int(state.depth or drafter.depth)),

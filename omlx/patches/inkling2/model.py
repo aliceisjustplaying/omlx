@@ -407,6 +407,11 @@ class Inkling2MoE(nn.Module):
         self.router_bias = mx.zeros((args.n_routed_experts,), dtype=mx.float32)
         self.experts = Inkling2Experts(args, w13_spec, w2_spec)
 
+    def _prepare_packed_views(self) -> None:
+        if mx.default_device() == mx.gpu:
+            kernels.prepare_moe_packed_views(self.experts.w13)
+            kernels.prepare_moe_packed_views(self.experts.w2)
+
     def _router_weight_fast(self) -> mx.array:
         cached = getattr(self, "_fast_router_cache", None)
         if cached is not None and cached[0] is self.router_weight:
@@ -442,10 +447,11 @@ class Inkling2MoE(nn.Module):
 class AttnResQuery(nn.Module):
     """Softmax over depth sources with learned queries (attention residual)."""
 
-    def __init__(self, hidden: int, num_queries: int = 1):
+    def __init__(self, hidden: int, num_queries: int = 1, eps: float = 1e-6):
         super().__init__()
         self.query = mx.zeros((num_queries, hidden), dtype=mx.float32)
         self.scale = hidden**-0.5
+        self._scale_eps_arr = mx.array([self.scale, eps], dtype=mx.float32)
 
     def __call__(self, blocks: list, partial_n: mx.array) -> mx.array:
         """``blocks``/``partial_n`` are unit-RMS FP32 sources [B, L, H].
@@ -453,6 +459,26 @@ class AttnResQuery(nn.Module):
         Returns [B, L, Q, H] FP32 mixtures.
         """
         return kernels.attn_res_mix(blocks, partial_n, self.query, self.scale)
+
+    def mix_raw(
+        self,
+        blocks: list,
+        partial: mx.array,
+        *,
+        norm_weights: tuple[mx.array, ...] | None = None,
+        out_dtype=None,
+        emit_partial_n: bool = False,
+    ):
+        """Fused unit-RMS(partial) + depth mix (+ optional RMSNorm + cast)."""
+        return kernels.attn_res_mix_raw(
+            blocks,
+            partial,
+            self.query,
+            self._scale_eps_arr,
+            norm_weights=norm_weights,
+            out_dtype=out_dtype,
+            emit_partial_n=emit_partial_n,
+        )
 
 
 def _mix_messages(x, message, down, gain_forget, down_t=None, gf_t=None):
@@ -733,6 +759,7 @@ class Inkling2Attention(nn.Module):
                 n_kv=self.n_kv,
                 head_dim=self.head_dim,
                 d_rel=self.d_rel,
+                fp8_kv=bool(self.fp8_kv),
             )
             rel = r @ self.rel_proj.astype(r.dtype)
             base_out = (q, k, v, rel, gate, sink, ks, vs)
@@ -778,7 +805,7 @@ class Inkling2Attention(nn.Module):
                 use_fp8 = kv.keys.dtype == mx.uint8
             elif state is not None and state.cache[windows.KEYS] is not None:
                 use_fp8 = state.cache[windows.KEYS].dtype == mx.uint8
-        if use_fp8:
+        if use_fp8 and k.dtype != mx.uint8:
             k = kernels.fp8_e4m3_quantize(k)
             v = kernels.fp8_e4m3_quantize(v)
         if kv is not None:
@@ -831,8 +858,8 @@ class Inkling2Layer(nn.Module):
         eps = args.rms_norm_eps
         h = args.hidden_size
         if layer_idx > 0:
-            self.attn_input = AttnResQuery(h, 1 if self.sliding else 3)
-        self.mlp_input = AttnResQuery(h, 1)
+            self.attn_input = AttnResQuery(h, 1 if self.sliding else 3, eps=eps)
+        self.mlp_input = AttnResQuery(h, 1, eps=eps)
         if layer_idx in args.loop_core:
             # Message queries and controllers for the q, k, v and MLP inputs,
             # in that order. Only passes after the first use them.
@@ -877,17 +904,78 @@ class Inkling2Layer(nn.Module):
 
     def _pre(self, h, blocks, ks, vs, tau=None, messages=None, down_t=None, gf_t=None):
         dtype = h.dtype
-        h_n = _unit_rms(h.astype(mx.float32))
+        h_n = None
         if self.layer_idx == 0:
-            xq = xk = xv = h
+            if self.is_boundary:
+                h_n = _unit_rms(h.astype(mx.float32))
+            if messages is None and self.sliding:
+                xq = self.attn_norm(h).astype(dtype)
+                xk = xv = None
+            else:
+                xq = xk = xv = h
+                if messages is not None:
+                    mixed_m = _mix_messages(
+                        mx.stack([xq, xk, xv]),
+                        messages[:, :, :3].transpose(2, 0, 1, 3),
+                        self.loop_down[:3],
+                        self.loop_gain_forget[:3],
+                        None if down_t is None else down_t[:3],
+                        None if gf_t is None else gf_t[:3],
+                    )
+                    if self.sliding:
+                        mixed_m = self.attn_norm(mixed_m).astype(dtype)
+                        xq, xk, xv = mixed_m[0], mixed_m[1], mixed_m[2]
+                    else:
+                        xq = self.q_input_norm(mixed_m[0]).astype(dtype)
+                        xk = self.k_input_norm(mixed_m[1]).astype(dtype)
+                        xv = self.v_input_norm(mixed_m[2]).astype(dtype)
+                else:
+                    xq = self.q_input_norm(xq).astype(dtype)
+                    xk = self.k_input_norm(xk).astype(dtype)
+                    xv = self.v_input_norm(xv).astype(dtype)
+        elif messages is None:
+            if self.sliding:
+                res = self.attn_input.mix_raw(
+                    blocks,
+                    h,
+                    norm_weights=(self.attn_norm.weight,),
+                    out_dtype=dtype,
+                    emit_partial_n=self.is_boundary,
+                )
+                if self.is_boundary:
+                    xq, h_n = res
+                else:
+                    xq = res
+                xk = xv = None
+            else:
+                res = self.attn_input.mix_raw(
+                    blocks,
+                    h,
+                    norm_weights=(
+                        self.q_input_norm.weight,
+                        self.k_input_norm.weight,
+                        self.v_input_norm.weight,
+                    ),
+                    out_dtype=dtype,
+                    emit_partial_n=self.is_boundary,
+                )
+                if self.is_boundary:
+                    (xq, xk, xv), h_n = res
+                else:
+                    xq, xk, xv = res
         else:
-            mixed = self.attn_input(blocks, h_n)
+            res = self.attn_input.mix_raw(
+                blocks, h, emit_partial_n=self.is_boundary
+            )
+            if self.is_boundary:
+                mixed, h_n = res
+            else:
+                mixed = res
             if self.sliding:
                 xq = xk = xv = mixed[:, :, 0]
             else:
                 xq, xk, xv = mixed[:, :, 0], mixed[:, :, 1], mixed[:, :, 2]
-        if messages is not None:
-            xq, xk, xv = _mix_messages(
+            mixed_m = _mix_messages(
                 mx.stack([xq, xk, xv]),
                 messages[:, :, :3].transpose(2, 0, 1, 3),
                 self.loop_down[:3],
@@ -895,16 +983,17 @@ class Inkling2Layer(nn.Module):
                 None if down_t is None else down_t[:3],
                 None if gf_t is None else gf_t[:3],
             )
-        if self.sliding and messages is None:
-            xq = self.attn_norm(xq).astype(dtype)
-            xk = xv = None
-        elif self.sliding:
-            xq, xk, xv = (self.attn_norm(x).astype(dtype) for x in (xq, xk, xv))
-        else:
-            xq = self.q_input_norm(xq).astype(dtype)
-            xk = self.k_input_norm(xk).astype(dtype)
-            xv = self.v_input_norm(xv).astype(dtype)
-        return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
+            if self.sliding:
+                mixed_m = self.attn_norm(mixed_m).astype(dtype)
+                xq, xk, xv = mixed_m[0], mixed_m[1], mixed_m[2]
+            else:
+                xq = self.q_input_norm(mixed_m[0]).astype(dtype)
+                xk = self.k_input_norm(mixed_m[1]).astype(dtype)
+                xv = self.v_input_norm(mixed_m[2]).astype(dtype)
+        proj = self.attn.project(xq, xk, xv, ks, vs, tau)
+        if self.is_boundary:
+            return (*proj, h_n)
+        return proj
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None, down_t=None, gf_t=None):
         a = self.attn.output(out, gate)
@@ -917,8 +1006,16 @@ class Inkling2Layer(nn.Module):
             residual=None if self.is_boundary else h,
             out_dtype=mx.float32,
         )
-        y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
-        if messages is not None:
+        if messages is None:
+            m_in = self.mlp_input.mix_raw(
+                mlp_blocks,
+                residual,
+                norm_weights=(self.mlp_norm.weight,),
+                out_dtype=h.dtype,
+            )
+            m = self.mlp(m_in)
+        else:
+            y = self.mlp_input.mix_raw(mlp_blocks, residual)[:, :, 0]
             y = _mix_messages(
                 y[None],
                 messages[None, :, :, 3],
@@ -927,7 +1024,7 @@ class Inkling2Layer(nn.Module):
                 None if down_t is None else down_t[3:],
                 None if gf_t is None else gf_t[3:],
             )[0]
-        m = self.mlp(self.mlp_norm(y).astype(h.dtype))
+            m = self.mlp(self.mlp_norm(y).astype(h.dtype))
         out_h, s3, rm = _static_conv(
             m,
             self.mlp_conv,
@@ -940,6 +1037,157 @@ class Inkling2Layer(nn.Module):
         if ra is not None:
             return out_h, s2, s3, ra, rm
         return out_h, s2, s3
+
+    def _forward_last_visit_tail(self, h, blocks, cache):
+        """Cache-only last-visit prefill: full K/V + 6-row tail for conv states."""
+        b, length, hidden = h.shape
+        kv, conv = cache
+        attn = self.attn
+        dkv = attn.dkv
+        tail = 6
+        keep = self._conv_k - 1
+        states = []
+        for slot, width in ((0, dkv), (1, dkv), (2, hidden), (3, hidden)):
+            s = conv[slot] if conv is not None else None
+            if s is None:
+                s = mx.zeros((b, keep, width), dtype=mx.float32)
+            states.append(s)
+        tau = attn.log_tau(kv, length)
+        res = self.attn_input.mix_raw(
+            blocks,
+            h,
+            norm_weights=(
+                self.q_input_norm.weight,
+                self.k_input_norm.weight,
+                self.v_input_norm.weight,
+            ),
+            out_dtype=h.dtype,
+            emit_partial_n=self.is_boundary,
+        )
+        if self.is_boundary:
+            (xq, xk, xv), h_n = res
+        else:
+            xq, xk, xv = res
+            h_n = None
+        kp = _wide_linear(attn.k_proj, xk)
+        vp = _wide_linear(attn.v_proj, xv)
+        k, ks = _dynamic_conv(
+            kp[..., :dkv],
+            kp[..., dkv:],
+            attn.k_static,
+            states[0],
+            attn.n_kv,
+            attn._dconv_scale,
+        )
+        v, vs = _dynamic_conv(
+            vp[..., :dkv],
+            vp[..., dkv:],
+            attn.v_static,
+            states[1],
+            attn.n_kv,
+            attn._dconv_scale,
+        )
+        xq_t = xq[:, -tail:, :]
+        q_t, r_t, gate_t, sink_t = mx.split(
+            _wide_linear(attn.q_proj, xq_t), attn._cuts, axis=-1
+        )
+        tau_t = None if tau is None else tau[:, -tail:, :, :]
+        if (
+            mx.default_device() == mx.gpu
+            and attn.head_dim % 32 == 0
+            and attn.d_rel <= 32
+            and k.dtype == v.dtype == q_t.dtype == r_t.dtype
+        ):
+            _, k, v, _ = kernels.fused_head_prep(
+                k[:, :, :1],
+                k,
+                v,
+                k[:, :, :1],
+                attn.q_scale,
+                attn.r_scale,
+                attn._prep_params,
+                None,
+                n_heads=0,
+                n_kv=attn.n_kv,
+                head_dim=attn.head_dim,
+                d_rel=attn.d_rel,
+                fp8_kv=bool(attn.fp8_kv),
+            )
+            q_t, _, _, r_t = kernels.fused_head_prep(
+                q_t,
+                q_t[:, :, :1],
+                q_t[:, :, :1],
+                r_t,
+                attn.q_scale,
+                attn.r_scale,
+                attn._prep_params,
+                tau_t,
+                n_heads=attn.n_heads,
+                n_kv=0,
+                head_dim=attn.head_dim,
+                d_rel=attn.d_rel,
+                fp8_kv=False,
+            )
+            rel_t = r_t @ attn.rel_proj.astype(r_t.dtype)
+        else:
+            k = _l2_clip(
+                k.reshape(b, length, attn.n_kv, attn.head_dim), attn._one, attn._qk_clip
+            ).transpose(0, 2, 1, 3)
+            v = _unit_rms(
+                v.reshape(b, length, attn.n_kv, attn.head_dim).astype(mx.float32)
+            ).astype(xk.dtype).transpose(0, 2, 1, 3)
+            q_t = _l2_clip(
+                q_t.reshape(b, tail, attn.n_heads, attn.head_dim),
+                attn.q_scale,
+                attn._qk_clip,
+            )
+            r_t = _l2_clip(
+                r_t.reshape(b, tail, attn.n_heads, attn.d_rel),
+                attn.r_scale,
+                attn._r_clip,
+            )
+            if tau_t is not None:
+                q_t = (q_t.astype(mx.float32) * tau_t).astype(q_t.dtype)
+                r_t = (r_t.astype(mx.float32) * tau_t).astype(r_t.dtype)
+            rel_t = r_t @ attn.rel_proj.astype(r_t.dtype)
+            q_t = q_t.transpose(0, 2, 1, 3)
+
+        out_t = attn.attend(q_t, k, v, rel_t, sink_t, kv, conv)
+        a_t = attn.output(out_t, gate_t)
+        residual_t, s2, ra = _static_conv(
+            a_t,
+            self.attn_conv,
+            states[2],
+            self._conv_scale,
+            self._conv_scale_arr,
+            residual=None if self.is_boundary else h[:, -tail:, :],
+            out_dtype=mx.float32,
+        )
+        mlp_blocks_t = [blk[:, -keep:, :] for blk in blocks]
+        if self.is_boundary and h_n is not None:
+            mlp_blocks_t.append(h_n[:, -keep:, :])
+        m_in_t = self.mlp_input.mix_raw(
+            mlp_blocks_t,
+            residual_t[:, -keep:, :],
+            norm_weights=(self.mlp_norm.weight,),
+            out_dtype=h.dtype,
+        )
+        m_t = self.mlp(m_in_t)
+        out_h, s3, rm = _static_conv(
+            m_t,
+            self.mlp_conv,
+            states[3],
+            self._conv_scale,
+            self._conv_scale_arr,
+            residual=residual_t[:, -keep:, :],
+            out_dtype=h.dtype,
+        )
+        if conv is not None:
+            conv[0] = ks[:, -keep:] * 1.0
+            conv[1] = vs[:, -keep:] * 1.0
+            conv[2] = s2 if ra is not None else s2[:, -keep:] * 1.0
+            conv[3] = s3 if rm is not None else s3[:, -keep:] * 1.0
+        return out_h
 
     def __call__(self, h, blocks, cache=None, bank=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
@@ -966,11 +1214,18 @@ class Inkling2Layer(nn.Module):
             down_t, gf_t = self._packed_loop()
         if b * length <= 16 and mx.default_device() == mx.gpu:
             self.mlp._router_weight_fast()
+            self.mlp._prepare_packed_views()
         pre_out = pre(h, blocks, states[0], states[1], tau, messages, down_t, gf_t)
-        if len(pre_out) == 11:
-            q, k, v, rel, gate, sink, ks, vs, rk, rv, h_n = pre_out
+        if self.is_boundary:
+            h_n = pre_out[-1]
+            proj_out = pre_out[:-1]
         else:
-            q, k, v, rel, gate, sink, ks, vs, h_n = pre_out
+            h_n = None
+            proj_out = pre_out
+        if len(proj_out) == 10:
+            q, k, v, rel, gate, sink, ks, vs, rk, rv = proj_out
+        else:
+            q, k, v, rel, gate, sink, ks, vs = proj_out
             rk = rv = None
         out = self.attn.attend(q, k, v, rel, sink, kv, conv)
         if self.is_boundary:
@@ -1014,7 +1269,9 @@ class Inkling2TextModel(nn.Module):
             Inkling2Layer(args, i, *_expert_specs(args, quant, i))
             for i in range(args.num_hidden_layers)
         ]
-        self.final_input = AttnResQuery(args.hidden_size, 1)
+        self.final_input = AttnResQuery(
+            args.hidden_size, 1, eps=args.rms_norm_eps
+        )
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self._schedule = tuple(args.layer_schedule())
         self._core_start = args.loop_core.start if args.loop_config else None
@@ -1059,7 +1316,19 @@ class Inkling2TextModel(nn.Module):
             for kv, state in layout
         ]
 
-    def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
+    # Decode/verify steps build ~1,900 dispatches across 48 visits; start
+    # encoding every 8 visits so the GPU stays busy while Python builds the
+    # remaining visits (scheduling only, bit-exact).
+    _DECODE_EVAL_EVERY = 8
+
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        capture=None,
+        trim_last_visit: bool = False,
+    ):
         """``capture`` maps draft feature ids to fill: ``i`` < num visits is
         the partial block sum entering layer visit ``i``; ``num visits`` is
         the final-norm output."""
@@ -1070,6 +1339,12 @@ class Inkling2TextModel(nn.Module):
         visits = [None] * self.num_visits if cache is None else self.visit_caches(cache)
         blocks: list = []
         prelude = bank = None
+        eval_every = (
+            self._DECODE_EVAL_EVERY
+            if h.shape[0] == 1 and h.shape[1] <= _COMPILED_MAX_TOKENS
+            else 0
+        )
+        n_visits = self.num_visits
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, visits)):
             if idx == self._core_start and prelude is None:
                 prelude = (h, list(blocks))
@@ -1083,9 +1358,23 @@ class Inkling2TextModel(nn.Module):
                 h, blocks = prelude[0], list(prelude[1])
             if capture is not None and visit in capture:
                 capture[visit] = h
+            if (
+                trim_last_visit
+                and visit + 1 == n_visits
+                and capture is None
+                and h.shape[1] >= 64
+                and not self.layers[idx].sliding
+                and loop_pass == 0
+                and c is not None
+                and c[0] is not None
+            ):
+                return self.layers[idx]._forward_last_visit_tail(h, blocks, cache=c)
             h = self.layers[idx](h, blocks, cache=c, bank=bank if loop_pass else None)
-        x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
-        out = self.norm(x).astype(h.dtype)
+            if eval_every and (visit + 1) % eval_every == 0 and visit + 1 < n_visits:
+                mx.async_eval(h)
+        out = self.final_input.mix_raw(
+            blocks, h, norm_weights=(self.norm.weight,), out_dtype=h.dtype
+        )
         if capture is not None and self.num_visits in capture:
             capture[self.num_visits] = out
         return out
@@ -1151,6 +1440,41 @@ class Model(nn.Module):
         rows = features[mx.maximum(rows, 0)].astype(embeds.dtype)
         return mx.where(mask[..., None], rows, embeds)
 
+    def _omlx_prefill(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        next_prefill_tokens=0,
+        pixel_values=None,
+        image_grid_thw=None,
+        capture_layer_ids=None,
+        **kwargs,
+    ):
+        """Scheduler cache-only prefill hook.
+
+        Chunks before the drafter capture window only need KV and conv cache
+        updates, so visit 47 runs full K/V projection plus a 6-row tail for
+        its conv states and skips ``lm_head``.
+        """
+        if pixel_values is not None:
+            input_embeddings = self.embed_inputs(inputs, pixel_values, image_grid_thw)
+        if not capture_layer_ids and not kwargs.get("return_hidden", False):
+            return self.model(
+                inputs,
+                cache,
+                input_embeddings,
+                trim_last_visit=True,
+            )
+        return self.forward(
+            inputs,
+            cache,
+            input_embeddings,
+            drafter=getattr(self, "_omlx_drafter", None),
+            capture_layer_ids=capture_layer_ids,
+            **kwargs,
+        )
+
     def __call__(
         self,
         inputs,
@@ -1197,6 +1521,10 @@ class Model(nn.Module):
         if observe:
             capture_layer_ids = list(drafter.target_layer_ids)
         if not capture_layer_ids and not return_hidden:
+            if kwargs.get("_omlx_prefill_trim") and not observe:
+                return self.model(
+                    inputs, cache, input_embeddings, trim_last_visit=True
+                )
             return self.logits_from_hidden(self.model(inputs, cache, input_embeddings))
         capture = {int(i): None for i in capture_layer_ids or ()}
         h = self.model(inputs, cache, input_embeddings, capture=capture)
