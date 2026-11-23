@@ -3374,3 +3374,200 @@ def flash_banded_attention_nax(
         output_dtypes=[mx.bfloat16],
     )[0]
     return out.transpose(0, 2, 1, 3)
+
+
+# ---------------------------------------------------------------------------
+# Fused attention head prep (L2-clip + V RMS norm + tau + head-major transpose)
+# and fused attention output gating (out * sigmoid(gate))
+# ---------------------------------------------------------------------------
+
+_FUSED_HEAD_PREP_SOURCE = r"""
+    constexpr uint PER = HD / 32u;
+    constexpr uint SLOTS = 2u * NH + 2u * NKV;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sid = threadgroup_position_in_grid.y;
+    const uint row = sid / SLOTS;
+    const uint slot = sid % SLOTS;
+    const uint b = row / L;
+    const uint l = row % L;
+    const float tv = HAS_TAU ? TAU[b * TAU_SB + l] : 1.0f;
+
+    if (slot < NH) {
+        const size_t soff = size_t(slot) * HD + lane * PER;
+        const size_t rbase = size_t(b) * QRAW_strides[0] + size_t(l) * QRAW_strides[1];
+        const size_t dst_base = ((size_t(b) * NH + slot) * L + l) * HD + lane * PER;
+        float xs[PER];
+        float acc = 0.0f;
+        for (uint j = 0u; j < PER; ++j) {
+            xs[j] = float(QRAW[rbase + (soff + j) * QRAW_strides[2]]) * float(QSCALE[soff + j]);
+            acc += xs[j] * xs[j];
+        }
+        acc = simd_sum(acc);
+        const float f = min(PR[0] / (metal::precise::sqrt(acc) + 1e-6f), 1.0f);
+        for (uint j = 0u; j < PER; ++j) {
+            T v = T(xs[j] * f);
+            if (HAS_TAU) v = T(float(v) * tv);
+            QO[dst_base + j] = v;
+        }
+    } else if (slot < NH + NKV) {
+        const uint h = slot - NH;
+        const size_t coff = size_t(h) * HD + lane * PER;
+        const size_t rbase = size_t(b) * KRAW_strides[0] + size_t(l) * KRAW_strides[1];
+        const size_t dst_base = ((size_t(b) * NKV + h) * L + l) * HD + lane * PER;
+        float xs[PER];
+        float acc = 0.0f;
+        for (uint j = 0u; j < PER; ++j) {
+            xs[j] = float(KRAW[rbase + (coff + j) * KRAW_strides[2]]);
+            acc += xs[j] * xs[j];
+        }
+        acc = simd_sum(acc);
+        const float f = min(PR[0] / (metal::precise::sqrt(acc) + 1e-6f), 1.0f);
+        for (uint j = 0u; j < PER; ++j) {
+            KO[dst_base + j] = T(xs[j] * f);
+        }
+    } else if (slot < NH + 2u * NKV) {
+        const uint h = slot - NH - NKV;
+        const size_t coff = size_t(h) * HD + lane * PER;
+        const size_t rbase = size_t(b) * VRAW_strides[0] + size_t(l) * VRAW_strides[1];
+        const size_t dst_base = ((size_t(b) * NKV + h) * L + l) * HD + lane * PER;
+        float xs[PER];
+        float acc = 0.0f;
+        for (uint j = 0u; j < PER; ++j) {
+            xs[j] = float(VRAW[rbase + (coff + j) * VRAW_strides[2]]);
+            acc += xs[j] * xs[j];
+        }
+        acc = simd_sum(acc);
+        const float inv = metal::precise::rsqrt(acc / float(HD) + 1e-6f);
+        for (uint j = 0u; j < PER; ++j) {
+            VO[dst_base + j] = T(xs[j] * inv);
+        }
+    } else {
+        const uint h = slot - NH - 2u * NKV;
+        const size_t rbase = size_t(b) * RRAW_strides[0] + size_t(l) * RRAW_strides[1];
+        const size_t dst_hbase = size_t(row) * (NH * DREL) + size_t(h) * DREL;
+        const size_t soff = size_t(h) * DREL;
+        float xj = (lane < DREL)
+            ? (float(RRAW[rbase + (soff + lane) * RRAW_strides[2]]) * float(RSCALE[soff + lane]))
+            : 0.0f;
+        float acc = simd_sum(xj * xj);
+        if (lane < DREL) {
+            const float f = min(PR[1] / (metal::precise::sqrt(acc) + 1e-6f), 1.0f);
+            T v = T(xj * f);
+            if (HAS_TAU) v = T(float(v) * tv);
+            RO[dst_hbase + lane] = v;
+        }
+    }
+"""
+
+_FUSED_GATED_OUT_SOURCE = r"""
+    const uint idx = thread_position_in_grid.x;
+    const uint total = B * L * HQ * D;
+    if (idx >= total) return;
+    const uint d = idx % D;
+    const uint t1 = idx / D;
+    const uint h = t1 % HQ;
+    const uint t2 = t1 / HQ;
+    const uint l = t2 % L;
+    const uint b = t2 / L;
+    const size_t o_off = size_t(b) * OUT_strides[0] + size_t(h) * OUT_strides[1]
+                       + size_t(l) * OUT_strides[2] + size_t(d) * OUT_strides[3];
+    const size_t g_off = size_t(b) * GATE_strides[0] + size_t(l) * GATE_strides[1]
+                       + size_t(h * D + d) * GATE_strides[2];
+    const float ov = float(OUT[o_off]);
+    const float gv = float(GATE[g_off]);
+    const float sig = 1.0f / (1.0f + metal::exp(-gv));
+    Y[idx] = T(ov * sig);
+"""
+
+_fused_head_prep_kernel = None
+_fused_gated_out_kernel = None
+
+
+def fused_head_prep(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    r: mx.array,
+    q_scale: mx.array,
+    r_scale: mx.array,
+    params: mx.array,
+    tau: mx.array | None,
+    *,
+    n_heads: int,
+    n_kv: int,
+    head_dim: int,
+    d_rel: int,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Fused L2-clip (q, k, r), unit-RMS (v), optional tau scale and head-major transpose."""
+    global _fused_head_prep_kernel
+    if _fused_head_prep_kernel is None:
+        _fused_head_prep_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_fused_head_prep",
+            input_names=["QRAW", "KRAW", "VRAW", "RRAW", "QSCALE", "RSCALE", "PR", "TAU"],
+            output_names=["QO", "KO", "VO", "RO"],
+            source=_FUSED_HEAD_PREP_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    b, length, _ = q.shape
+    has_tau = 1 if tau is not None else 0
+    if has_tau:
+        tau_sb = 0 if tau.shape[0] == 1 else length
+        tau_arr = mx.contiguous(tau.astype(mx.float32).reshape(-1))
+    else:
+        tau_sb = 0
+        tau_arr = _dummy_f32()
+    slots = 2 * n_heads + 2 * n_kv
+    return _fused_head_prep_kernel(
+        inputs=[
+            q,
+            k,
+            v,
+            r,
+            mx.contiguous(q_scale),
+            mx.contiguous(r_scale),
+            params,
+            tau_arr,
+        ],
+        template=[
+            ("T", q.dtype),
+            ("L", length),
+            ("NH", n_heads),
+            ("NKV", n_kv),
+            ("HD", head_dim),
+            ("DREL", d_rel),
+            ("HAS_TAU", has_tau),
+            ("TAU_SB", tau_sb),
+        ],
+        grid=(32, b * length * slots, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[
+            (b, n_heads, length, head_dim),
+            (b, n_kv, length, head_dim),
+            (b, n_kv, length, head_dim),
+            (b, length, n_heads, d_rel),
+        ],
+        output_dtypes=[q.dtype, k.dtype, v.dtype, r.dtype],
+    )
+
+
+def fused_gated_output(out: mx.array, gate: mx.array) -> mx.array:
+    """Fused head-major-to-token-major transpose + out * sigmoid(gate)."""
+    global _fused_gated_out_kernel
+    if _fused_gated_out_kernel is None:
+        _fused_gated_out_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_fused_gated_out",
+            input_names=["OUT", "GATE"],
+            output_names=["Y"],
+            source=_FUSED_GATED_OUT_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    b, hq, length, d = out.shape
+    total = b * length * hq * d
+    return _fused_gated_out_kernel(
+        inputs=[out, gate],
+        template=[("T", gate.dtype), ("B", b), ("L", length), ("HQ", hq), ("D", d)],
+        grid=(total, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(b, length, hq * d)],
+        output_dtypes=[gate.dtype],
+    )[0]

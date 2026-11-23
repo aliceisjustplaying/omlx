@@ -531,20 +531,64 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     return out.astype(x.dtype), xp
 
 
+def _wide_linear(proj: nn.Module, x: mx.array) -> mx.array:
+    """Bit-exact wide-M 8-bit affine matmul (dequantize once + plain GEMM) on prefill."""
+    if (
+        isinstance(proj, nn.QuantizedLinear)
+        and proj.bits == 8
+        and getattr(proj, "mode", "affine") == "affine"
+        and x.shape[0] * x.shape[1] >= 1024
+        and mx.default_device() == mx.gpu
+    ):
+        w = mx.dequantize(
+            proj.weight,
+            proj.scales,
+            proj.get("biases"),
+            group_size=proj.group_size,
+            bits=8,
+            mode="affine",
+            dtype=x.dtype,
+        )
+        y = x @ w.T
+        bias = proj.get("bias")
+        if bias is not None:
+            y = y + bias
+        return y
+    return proj(x)
+
+
 def _linear_slice(proj: nn.Module, x: mx.array, start: int, stop: int | None) -> mx.array:
     """Apply rows ``[start:stop]`` of a Linear or QuantizedLinear without copying."""
     if isinstance(proj, nn.QuantizedLinear):
         biases = proj.get("biases")
-        y = mx.quantized_matmul(
-            x,
-            proj.weight[start:stop],
-            proj.scales[start:stop],
-            None if biases is None else biases[start:stop],
-            transpose=True,
-            group_size=proj.group_size,
-            bits=proj.bits,
-            mode=getattr(proj, "mode", "affine"),
-        )
+        mode = getattr(proj, "mode", "affine")
+        if (
+            proj.bits == 8
+            and mode == "affine"
+            and x.shape[0] * x.shape[1] >= 1024
+            and mx.default_device() == mx.gpu
+        ):
+            w = mx.dequantize(
+                proj.weight[start:stop],
+                proj.scales[start:stop],
+                None if biases is None else biases[start:stop],
+                group_size=proj.group_size,
+                bits=8,
+                mode="affine",
+                dtype=x.dtype,
+            )
+            y = x @ w.T
+        else:
+            y = mx.quantized_matmul(
+                x,
+                proj.weight[start:stop],
+                proj.scales[start:stop],
+                None if biases is None else biases[start:stop],
+                transpose=True,
+                group_size=proj.group_size,
+                bits=proj.bits,
+                mode=mode,
+            )
     else:
         y = x @ proj.weight[start:stop].T
     bias = proj.get("bias")
@@ -598,6 +642,9 @@ class Inkling2Attention(nn.Module):
         self.rel_proj = mx.zeros((self.d_rel, self.rel_extent))
         self._qk_clip = mx.array(args.qk_l2_clip_threshold, dtype=mx.float32)
         self._r_clip = mx.array(args.rel_l2_clip_threshold, dtype=mx.float32)
+        self._prep_params = mx.array(
+            [args.qk_l2_clip_threshold, args.rel_l2_clip_threshold], dtype=mx.float32
+        )
         self._one = mx.array(1.0, dtype=mx.float32)
         self._sconv_scale = 1.0 / math.sqrt(self.conv_k + 1)
         self._sconv_scale_arr = mx.array([self._sconv_scale], dtype=mx.float32)
@@ -625,7 +672,9 @@ class Inkling2Attention(nn.Module):
         dkv = self.dkv
         if self.sliding:
             if xk is None:
-                q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+                q, k, v, r, gate, sink = mx.split(
+                    _wide_linear(self.in_proj, xq), self._cuts, axis=-1
+                )
             else:
                 # Looped passes give q, k and v their own inputs; slice the
                 # packed projection into zero-copy row views so each row is
@@ -643,9 +692,11 @@ class Inkling2Attention(nn.Module):
                 v, self.v_conv, vs, self._sconv_scale, self._sconv_scale_arr
             )
         else:
-            q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
-            kp = self.k_proj(xk)
-            vp = self.v_proj(xv)
+            q, r, gate, sink = mx.split(
+                _wide_linear(self.q_proj, xq), self._cuts, axis=-1
+            )
+            kp = _wide_linear(self.k_proj, xk)
+            vp = _wide_linear(self.v_proj, xv)
             k, ks = _dynamic_conv(
                 kp[..., :dkv],
                 kp[..., dkv:],
@@ -663,6 +714,31 @@ class Inkling2Attention(nn.Module):
                 self._dconv_scale,
             )
             rk = rv = None
+        if (
+            mx.default_device() == mx.gpu
+            and self.head_dim % 32 == 0
+            and self.d_rel <= 32
+            and q.dtype == k.dtype == v.dtype == r.dtype
+        ):
+            q, k, v, r = kernels.fused_head_prep(
+                q,
+                k,
+                v,
+                r,
+                self.q_scale,
+                self.r_scale,
+                self._prep_params,
+                tau,
+                n_heads=self.n_heads,
+                n_kv=self.n_kv,
+                head_dim=self.head_dim,
+                d_rel=self.d_rel,
+            )
+            rel = r @ self.rel_proj.astype(r.dtype)
+            base_out = (q, k, v, rel, gate, sink, ks, vs)
+            if rk is not None:
+                return (*base_out, rk, rv)
+            return base_out
         q = _l2_clip(
             q.reshape(b, length, self.n_heads, self.head_dim),
             self.q_scale,
@@ -722,12 +798,15 @@ class Inkling2Attention(nn.Module):
         )
 
     def output(self, out, gate):
-        b, _, length, _ = out.shape
-        out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
-        out = (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(
-            gate.dtype
-        )
-        return self.o_proj(out)
+        if mx.default_device() == mx.gpu and out.dtype == gate.dtype:
+            out = kernels.fused_gated_output(out, gate)
+        else:
+            b, _, length, _ = out.shape
+            out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
+            out = (
+                out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))
+            ).astype(gate.dtype)
+        return _wide_linear(self.o_proj, out)
 
 
 def _cumsum(xs):
