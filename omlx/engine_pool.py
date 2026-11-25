@@ -4577,6 +4577,7 @@ class EnginePool:
             if (
                 model_settings is not None
                 and getattr(model_settings, "mtp_enabled", False)
+                and getattr(engine, "dflash_drafter", None) is None
                 and entry.config_model_type in INKLING2_MODEL_TYPES
                 and hasattr(engine, "prepare_dflash_target")
             ):

@@ -441,12 +441,25 @@ class DraftPolicy:
             surv *= p_i
             next_expected = best_expected + surv
             next_rate = next_expected / (costs.verify_ms(i + 2) + sunk)
-            if next_rate >= best_rate or (
+            # F_i-measurable tail lookahead: evaluate extending to j >= i using
+            # only conf[:i+1] and historical position_rate(j) from prior cycles
+            # (strictly independent of d_i and conf[i+1:]).
+            future_rate = next_rate
+            tail_exp = next_expected
+            tail_surv = surv
+            for j in range(i + 1, n):
+                tail_surv *= self.position_rate(j)
+                tail_exp += tail_surv
+                r = tail_exp / (costs.verify_ms(j + 2) + sunk)
+                if r > future_rate:
+                    future_rate = r
+            if future_rate >= best_rate or (
                 costs.unmeasured(i + 2) and p_i >= _PROBE_RATE
             ):
                 k = i + 1
                 best_expected = next_expected
-                best_rate = next_rate
+                if next_rate > best_rate:
+                    best_rate = next_rate
             else:
                 break
         if k == 0 and self._plain_rounds >= _REPROBE:

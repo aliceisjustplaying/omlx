@@ -4923,7 +4923,7 @@ def _run_verify_cycle_chain(
     # time is the batch's, not this window's.
     own_forward = verify_result is None
     cycle_conf = None
-    if drafter is not None and own_forward and policy is not None:
+    if drafter is not None and own_forward and policy is not None and drafter.adaptive:
         if not state.copy_drafts:
             cycle_conf = _stated_chances(state)
         if cycle_conf:

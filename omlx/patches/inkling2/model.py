@@ -387,7 +387,7 @@ class Inkling2Experts(nn.Module):
                 self._inv_nvfp4,
             )
         if (
-            x.shape[0] >= 64
+            x.shape[0] >= 17
             and x.dtype == mx.bfloat16
             and self.w13.bits == 4
             and self.w2.bits == 4

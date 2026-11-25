@@ -152,8 +152,11 @@ class DFlashDrafter:
         self.context_copy = False
         # Lightning MTP's draft policy sizes each verify window from the
         # head's stated chance per draft, so every block position is drafted.
-        # Only a head with ``block_confidence`` states them.
+        # Only a head with ``block_confidence`` or fused DFlash2 selector states them.
         self.confidence_windows = False
+        selector = getattr(model, "candidate_selector", None)
+        if selector is not None and getattr(selector, "top_k", 0) == 16:
+            self.states_chances = True
 
     @property
     def window(self) -> int:
@@ -491,7 +494,10 @@ class DFlashDrafter:
             set_verify_qmm_armed(False)
         for (state, *_), proposal in zip(rows, proposals):
             self._commit_proposals(state, *proposal)
-            mx.async_eval(state.drafts)
+            to_eval = [state.drafts, *selection.q_arrays(state.draft_accept_lps)]
+            if state.draft_conf is not None:
+                to_eval.append(state.draft_conf)
+            mx.async_eval(*to_eval)
         # Dispatch time shared across the rows; the GPU work overlaps the
         # next verify like the MTP head's async draft.
         share = (time.perf_counter() - started) * 1000 / max(1, len(rows))
@@ -530,14 +536,18 @@ class DFlashDrafter:
         finally:
             set_verify_qmm_armed(False)
         self._predraft.unfed = [unfed]
-        tokens, accept_lps, *_ = proposals[0]
+        tokens, accept_lps, *rest = proposals[0]
+        conf = rest[0] if rest else None
         if isinstance(tokens, list):
             # The controller picks the next depth after this cycle. Start the
             # positions its current depth needs; adopting evaluates the rest
             # only if it asks for more.
             count = self._proposal_count(state)
             tokens, accept_lps = tokens[:count], accept_lps[:count]
-        mx.async_eval(tokens, *selection.q_arrays(accept_lps))
+        to_eval = [tokens, *selection.q_arrays(accept_lps)]
+        if conf is not None and self.confidence_windows:
+            to_eval.append(conf)
+        mx.async_eval(*to_eval)
         return True
 
     def extend_context(self, state, captured) -> None:
@@ -749,15 +759,25 @@ class DFlashDrafter:
                 continue
             pos[index, slots_b] = mx.arange(b, b + n, dtype=mx.int32)
         # Attend the newest ``slots`` committed positions; block keys always.
-        # Unwritten slots hold position -1 until the ring fills.
+        # Unwritten slots hold position -1 until the ring fills. While the ring
+        # has not wrapped yet, slice SDPA to the populated 64-aligned prefix.
+        max_written = max((b + n for b, n in zip(bases, lengths)), default=0)
+        active_cap = (
+            min(capacity, max(64, ((max_written + 63) // 64) * 64))
+            if max_written < capacity
+            else capacity
+        )
+        pos_attn = pos[:, :active_cap] if active_cap < capacity else pos
         ring_valid = (
-            (pos >= 0) & (pos >= (totals - slots)[:, None]) & (pos < totals[:, None])
+            (pos_attn >= 0)
+            & (pos_attn >= (totals - slots)[:, None])
+            & (pos_attn < totals[:, None])
         )
         if self.causal:
             # Each block query sees the context and the block rows up to it.
             mask = mx.concatenate(
                 [
-                    mx.broadcast_to(ring_valid[:, None, :], (batch, block, capacity)),
+                    mx.broadcast_to(ring_valid[:, None, :], (batch, block, active_cap)),
                     mx.broadcast_to(
                         mx.tril(mx.ones((block, block), dtype=mx.bool_)),
                         (batch, block, block),
@@ -768,9 +788,9 @@ class DFlashDrafter:
         elif self.query_windows:
             lower = totals[:, None] + mx.arange(block, dtype=mx.int32) - slots
             windowed = (
-                (pos[:, None, :] >= 0)
-                & (pos[:, None, :] >= lower[:, :, None])
-                & (pos[:, None, :] < totals[:, None, None])
+                (pos_attn[:, None, :] >= 0)
+                & (pos_attn[:, None, :] >= lower[:, :, None])
+                & (pos_attn[:, None, :] < totals[:, None, None])
             )
             mask = mx.concatenate(
                 [windowed, mx.ones((batch, block, block), dtype=mx.bool_)], axis=2
@@ -832,8 +852,10 @@ class DFlashDrafter:
                 prop_values = prop_values * self.value_scale
             queries = model.rope(queries, offset=query_offsets)
             prop_keys = model.rope(prop_keys, offset=query_offsets)
-            keys = mx.concatenate([ring_keys, prop_keys], axis=2)
-            values = mx.concatenate([ring_values, prop_values], axis=2)
+            rk_attn = ring_keys[:, :, :active_cap, :] if active_cap < capacity else ring_keys
+            rv_attn = ring_values[:, :, :active_cap, :] if active_cap < capacity else ring_values
+            keys = mx.concatenate([rk_attn, prop_keys], axis=2)
+            values = mx.concatenate([rv_attn, prop_values], axis=2)
             attended = mx.fast.scaled_dot_product_attention(
                 queries,
                 keys,

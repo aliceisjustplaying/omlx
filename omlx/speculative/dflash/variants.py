@@ -22,6 +22,11 @@ from ...patches import qwen35_verify_qmm
 
 def gated_mlp(mlp, x: mx.array) -> mx.array:
     """Gated MLP; eight-row verify shapes fuse gate, up and swiglu."""
+    gate_up = getattr(mlp, "gate_up_proj", None)
+    if gate_up is not None:
+        gu = gate_up(x)
+        half = gu.shape[-1] // 2
+        return mlp.down_proj(nn.silu(gu[..., :half]) * gu[..., half:])
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
     # The fused kernel computes SiLU gating; MLPs with their own activation
@@ -64,6 +69,19 @@ def project_qkv(attn, x: mx.array, context: mx.array) -> tuple:
     if context_kv is not None:
         # Context rows have their own K/V projections (Inkling 2).
         return (attn.q_proj(x), *context_kv(context), attn.k_proj(x), attn.v_proj(x))
+    kv_proj = getattr(attn, "kv_proj", None)
+    if kv_proj is not None:
+        width = int(context.shape[1])
+        kv = kv_proj(mx.concatenate([context, x], axis=1))
+        k_dim = int(getattr(attn, "_k_dim", attn.n_kv_heads * attn.head_dim))
+        ctx_kv, blk_kv = kv[:, :width], kv[:, width:]
+        return (
+            attn.q_proj(x),
+            ctx_kv[..., :k_dim],
+            ctx_kv[..., k_dim:],
+            blk_kv[..., :k_dim],
+            blk_kv[..., k_dim:],
+        )
     fused = getattr(attn, "qkv_proj", None)
     if fused is None:
         project_kv = getattr(attn, "_project_kv", None)

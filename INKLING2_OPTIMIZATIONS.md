@@ -2,7 +2,7 @@
 
 This fork extends [`jundot/omlx`](https://github.com/jundot/omlx) and [`masterfasa/omlx`](https://github.com/masterfasa/omlx) (`feat/inkling2-basalt-combined`, commit `e1bffb9`) with six targeted Python and Metal kernel changes (`+3,378 / -121` lines) for **Inkling 2 Mini** (`oQ4e` mixed 4-bit NVFP4/Affine-4 experts with its bundled **DSpark** recurrent draft head) on Apple Silicon.
 
-On an **Apple M5 Pro (48 GB unified memory)**, this branch reaches **1,693 tok/s** cold prefill at 6.7K (`4.11s` TTFT), **1,594 tok/s** at 27K (`13.37s`) and **1,303 tok/s** at 54K (+91% faster long-context prefill vs before the M5 Metal 4 and fusion patches), **81.6 tok/s** greedy 512-token code (3-run median, peak 82.9), **57.3 tok/s** greedy chat (peak 58.8), **105.6 / 106.3 tok/s** JSON, **125.7 / 124.5 tok/s** file edit (`0.15–0.18s` TTFT) and **50.5–55.7 tok/s** sampled decode from 6.7K to 54K context (**0.22–0.64s** warm TTFT on full-prefix retries).
+On an **Apple M5 Pro (48 GB unified memory)** with [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) (Q4 quantized drafter, lossless target verification), this branch reaches **1,473 tok/s** cold prefill at 6.7K (`4.78s` TTFT), **1,520 tok/s** at 27K (`14.00s`) and **1,308 tok/s** at 54K (`21.01s`), **51.5 tok/s** warm 54K sampled decode (`0.28s` TTFT, peak `54.1`), **106.9 / 124.1 tok/s** file edit, **96.1 / 98.0 tok/s** JSON, **72.3 / 82.7 tok/s** 512-token code and **56.2 / 57.4 tok/s** 512-token chat (symmetric 3-run medians, sampled `temp=1.0, top_p=0.95` / greedy `temp=0`).
 
 > **Default tradeoff**: This branch defaults `OMLX_INKLING2_FP8_KV` to `"all"` (lossy unit-scale FP8 E4M3 KV cache across all attention layers) for long-context throughput and memory headroom. Set `OMLX_INKLING2_FP8_KV=0` for BF16 KV cache.
 
@@ -177,9 +177,59 @@ curl -s http://127.0.0.1:8000/v1/models
 - **[`ShinMegamiBoson/lookatmyquant`](https://github.com/ShinMegamiBoson/lookatmyquant)** — pre-planned expert-grouping design inspiration for shared MoE experts across `L=3..16`.
 - **[`Eriskii/erisinky`](https://github.com/Eriskii/erisinky)** — Metal 4 `mpp::tensor_ops::matmul2d` FlashAttention (`k_attn_h`), per-simdgroup `matmul2d` MoE prefill (`k_moe_sg`), Y-axis cache-locality dispatch order, bit-exact BF16 router weights and fused post-conv+residual epilogues.
 - **[`ARahim3/mlx-dspark`](https://github.com/ARahim3/mlx-dspark)** — fused Inkling 2 attention head-prep (`inkling_fused.py`), fused output gating and bit-exact wide-M 8-bit prefill GEMMs (`wide_gemm.py`).
+- **[`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) & [`incoai/splash`](https://github.com/incoai/splash)** — Apache-2.0 5-layer DFlash2 block-diffusion drafter and its Inkling 2 tap/embedding/post-softcap integration contract (integrated losslessly through oMLX's exact target verification path).
 
 
-### Latest Pass: oMLX 0.8.3 Launch Cuts, Wide-Verify NAX MoE (`L>=10`) & Causal Sampled Stopping
+### Latest Pass (Pass 9): Native Lossless `Inkling-2-Mini-DFlash2`, Upstream `0.8.3+` Kernel Cuts & Causal Lookahead
+
+- **Self-contained Inkling 2 DFlash2 loader (`omlx/speculative/dflash/{__init__,drafter,kernels,selection,variants}.py`, `model_loading.py`, `engine_pool.py`)**: Loads [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) directly inside `omlx` with zero patches to external `mlx-vlm`:
+  - Validates and maps Inkling 2's 48 looped layer visits plus final post-norm tap (`target_layer_ids = [5, 23, 41, 48]`), binds normalized embeddings (`embed_norm(embed(tokens))`), masks padded vocab slots (`>= unpadded_vocab_size`) before top-16 candidate selection and applies `selector_softcap_mode="after_correction"` (`30.0 * tanh((unary + edge) / 30.0)`) inside `omlx_dflash2_select`.
+  - Emits per-position `F_p`-measurable confidence `conf` directly from `omlx_dflash2_select` so adaptive `DraftPolicy` (`window` / `causal_window`) dynamically sizes verify blocks (`adaptive` beat fixed `block=8` by +6% to +130% across all workloads).
+  - Fuses `k_proj + v_proj -> kv_proj` (1 weight read over `[context, block]` instead of 4) and `gate_proj + up_proj -> gate_up_proj` after quantization and slices DFlash2 SDPA to the 64-aligned active ring prefix before wraparound.
+  - Guarded in `engine_pool.py` so attaching an external DFlash2 drafter skips the bundled DSpark drafter.
+- **Upstream `jundot/omlx` & `mlx-serve` kernel wins (`kernels.py`, `model.py`)**:
+  - Lowers `moe_prefill_nax` from `L >= 64` to `L >= 17` (`jundot/omlx#5638`), eliminating the `L = 17..63` `gather_qmm` cliff (`L = 24 / 32 / 48` dropped from `157 / 190 / 275 ms` to `69.5 / 77.4 / 89.7 ms`, **2.26–3.06× faster**).
+  - Fully unrolls fixed-trip simdgroup fragment loops (`#pragma clang loop unroll(full)`) in `_GQA_DECODE_PART_SOURCE` (`jundot/omlx#5623`, bit-identical).
+  - Adds single-thread threadgroup fold reduction in `attn_res_mix_raw` (`ddalcu/mlx-serve#1319`, bit-exact).
+- **`F_i`-measurable causal lookahead (`draft_policy.py`, `batch_generator.py`)**: Evaluates extending past position `i` using only `conf[:i + 1]` plus historical `position_rate(j)` from prior cycles (strictly independent of `d_i` and `conf[i + 1:]`), keeping exact sampled speculative rejection sampling while preventing premature 1-step cutoffs. Also honors `dflash_verify_mode="dflash"` (`drafter.adaptive = False`) cleanly in `batch_generator.py`.
+
+#### Enabling `Inkling-2-Mini-DFlash2`
+
+Download the Apache-2.0 drafter next to Inkling 2 Mini and set DFlash2 in `~/.omlx/model_settings.json` (with `mtp_enabled: false` and Q4 drafter quantization, which matches BF16 acceptance at `~1.5 ms/block` lower latency):
+
+```bash
+hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ~/models/Inkling-2-Mini-DFlash2
+```
+
+```json
+"dflash_enabled": true,
+"dflash_draft_model": "~/models/Inkling-2-Mini-DFlash2",
+"dflash_draft_quant_enabled": true,
+"dflash_draft_quant_weight_bits": 4,
+"dflash_draft_quant_group_size": 64,
+"dflash_verify_mode": "adaptive",
+"mtp_enabled": false
+```
+
+#### Unified Symmetric 3-Run Medians (Apple M5 Pro 48 GB, Q4 DFlash2, Default Metal Caps)
+
+All rows below come from one continuous, unthrottled server run (`temp=1.0, top_p=0.95` sampled vs `temp=0` greedy with identical `max_tokens` per pair):
+
+| Workload | Sampled (`temp=1.0, top_p=0.95`) | Greedy (`temp=0`) | TTFT / Prefill |
+| :--- | :---: | :---: | :---: |
+| Cold 6.7K prompt (`0` cached, 512 out) | **55.6 tok/s** | — | **1,473 tok/s** (`4.78s`) |
+| Turn 2 27.2K prompt (`6.1K` cached) | **55.1 tok/s** | — | **1,520 tok/s** (`14.00s`) |
+| Turn 3 53.9K prompt (`26.6K` cached, 512 out) | **47.5 tok/s** | — | **1,308 tok/s** (`21.01s`) |
+| Warm 53.9K retry (3-run median, `53.9K` cached) | **51.5 tok/s** *(peak `54.1`)* | — | **`0.28s`** median TTFT |
+| File Edit (3-run median, `max=1024`) | **106.9 tok/s** *(full-file `106.9–111.7`)* | **124.1 tok/s** | `0.18s` TTFT |
+| JSON (3-run median, `max=1024`) | **96.1 tok/s** | **98.0 tok/s** | `0.18s` TTFT |
+| Code (3-run median, `max=512`) | **72.3 tok/s** *(peak `78.8`)* | **82.7 tok/s** *(peak `84.5`)* | `0.16–0.17s` TTFT |
+| Chat (3-run median, `max=512`) | **56.2 tok/s** *(peak `58.3`)* | **57.4 tok/s** *(peak `60.4`)* | `0.17s` TTFT |
+| Tool call (`read /etc/hosts`, greedy) | — | **1.47s** total (`0.19s` TTFT) | `finish_reason=tool_calls` |
+
+*(Pass 8 DSpark 3-run medians on the same prompts for direct comparison: `6.7K/27K/54K` prefill `1,365 / 1,247 / 1,130 tok/s`, warm `54K` decode `46.7 tok/s`, `JSON` `88.7 / 94.6`, `Code` `70.2 / 73.4`, `Chat` `51.7 / 53.0`, `Edit` `119.6 / 119.0`.)*
+
+### Previous Pass (Pass 8): oMLX 0.8.3 Launch Cuts, Wide-Verify NAX MoE (`L>=10`) & Causal Sampled Stopping
 
 - **Zero-copy strided `dynamic_conv_fused` (`kernels.py`, `model.py`)**: Replaces eager per-lag full-attention K/V dynamic convolutions with a single strided Metal kernel (`ensure_row_contiguous=False`, `0.000000` max diff across `L = 1..2048`), eliminating ~368 small launches per forward.
 - **oMLX 0.8.3 (`#5538`) launch reductions (`model.py`)**: Adds compiled `_logit_tail_compiled` (fusing FP32 cast, softcap and vocab bias for `L <= 16`), caches FP32 RMSNorm weight copies outside the parameter tree (`_keep_fp32_weight` / `_norm`) to drop ~84 BF16-to-FP32 weight casts on looped visits, shares `log_tau` across all 8 full-attention visits and keeps zero-copy conv state views on short decode/verify windows and rollbacks.

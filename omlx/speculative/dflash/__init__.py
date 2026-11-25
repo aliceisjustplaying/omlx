@@ -116,7 +116,7 @@ def _target_float_dtype(target_model: Any):
     """Float dtype of the target's token embedding (its scales when quantized)."""
     language_model = getattr(target_model, "language_model", target_model)
     inner = getattr(language_model, "model", language_model)
-    embed = getattr(inner, "embed_tokens", None)
+    embed = getattr(inner, "embed_tokens", None) or getattr(inner, "embed", None)
     for name in ("scales", "weight"):
         value = getattr(embed, name, None)
         if isinstance(value, mx.array) and mx.issubdtype(value.dtype, mx.floating):
@@ -134,7 +134,8 @@ def match_target_dtype(model: nn.Module, target_model: Any) -> int:
     narrower mantissa than the target produced them. Parameters that do not
     fit fp16 leave the drafter unchanged. Returns the number of cast arrays.
     """
-    if _target_float_dtype(target_model) != mx.float16:
+    target_dtype = _target_float_dtype(target_model)
+    if target_dtype is None or target_dtype != mx.float16:
         return 0
     params = [
         p for _, p in tree_flatten(model.parameters()) if p.dtype == mx.bfloat16
@@ -158,6 +159,181 @@ def match_target_dtype(model: nn.Module, target_model: Any) -> int:
     return len(params)
 
 
+def _is_inkling2_target(target_model: Any) -> bool:
+    language_model = getattr(target_model, "language_model", target_model)
+    text = getattr(language_model, "model", None)
+    return (
+        text is not None
+        and hasattr(text, "num_visits")
+        and hasattr(text, "embed_norm")
+        and hasattr(text, "embed")
+    )
+
+
+def _load_inkling2_dflash2_model(local, raw_config: dict, target_model: Any) -> nn.Module:
+    """Load a DFlash2 checkpoint whose target_layer_ids address Inkling 2 visits.
+
+    Inkling 2 loops 24 physical layers through 48 visits plus final post-norm
+    tap 48 (``target_layer_ids = [5, 23, 41, 48]`` with ``num_target_layers = 48``),
+    which mlx-vlm's ``DFlash2Config.validate`` rejects. Load and validate here
+    without patching mlx-vlm.
+    """
+    from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+
+    language_model = getattr(target_model, "language_model", target_model)
+    text = language_model.model
+    num_visits = int(text.num_visits)
+    dflash_cfg = dict(raw_config.get("dflash_config") or {})
+    real_tids = [int(i) for i in dflash_cfg.get("target_layer_ids") or ()]
+    if not real_tids or any(
+        i < 0 or i > num_visits or (idx > 0 and real_tids[idx - 1] >= i)
+        for idx, i in enumerate(real_tids)
+    ):
+        raise ValueError(
+            f"Inkling 2 DFlash2 target_layer_ids {real_tids!r} invalid for "
+            f"{num_visits} visits"
+        )
+    num_target = int(raw_config.get("num_target_layers") or num_visits)
+    if num_target != num_visits:
+        raise ValueError(
+            f"Inkling 2 DFlash2 expects {num_target} visits, target has {num_visits}"
+        )
+    target_args = getattr(language_model, "args", None)
+    target_text_args = getattr(target_args, "text", target_args)
+    if target_text_args is not None:
+        if int(raw_config["hidden_size"]) != int(target_text_args.hidden_size):
+            raise ValueError(
+                f"Inkling 2 DFlash2 hidden_size {raw_config['hidden_size']} != "
+                f"target {target_text_args.hidden_size}"
+            )
+        if int(raw_config["vocab_size"]) != int(target_text_args.vocab_size):
+            raise ValueError(
+                f"Inkling 2 DFlash2 vocab_size {raw_config['vocab_size']} != "
+                f"target {target_text_args.vocab_size}"
+            )
+    if not hasattr(language_model, "rollback_speculative_cache"):
+        raise ValueError("Inkling 2 target does not implement rollback_speculative_cache")
+
+    patched = dict(raw_config)
+    patched_dflash = dict(dflash_cfg)
+    patched_dflash["target_layer_ids"] = list(range(len(real_tids)))
+    patched["dflash_config"] = patched_dflash
+    cfg = DFlash2Config.from_dict(patched)
+    cfg.target_layer_ids = real_tids
+
+    model = DFlash2DraftModel(cfg)
+    shards = sorted(local.glob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"No safetensors shards found in {local}")
+    weights = {}
+    for shard in shards:
+        weights.update(mx.load(str(shard)))
+    weights = model.sanitize(weights)
+    model.load_weights(list(weights.items()), strict=True)
+    return model
+
+
+def _concat_linear_pair(a: nn.Module, b: nn.Module) -> nn.Module | None:
+    """Fuse two bias-free (Quantized)Linear layers with matching input dims."""
+    if getattr(a, "bias", None) is not None or getattr(b, "bias", None) is not None:
+        return None
+    if isinstance(a, nn.QuantizedLinear) and isinstance(b, nn.QuantizedLinear):
+        if (
+            a.bits != b.bits
+            or a.group_size != b.group_size
+            or getattr(a, "mode", "affine") != getattr(b, "mode", "affine")
+        ):
+            return None
+        out_dims = int(a.weight.shape[0]) + int(b.weight.shape[0])
+        in_dims = int(a.weight.shape[1]) * (32 // int(a.bits))
+        fused = nn.QuantizedLinear(
+            in_dims,
+            out_dims,
+            bias=False,
+            group_size=a.group_size,
+            bits=a.bits,
+            mode=getattr(a, "mode", "affine"),
+        )
+        fused.weight = mx.concatenate([a.weight, b.weight], axis=0)
+        fused.scales = mx.concatenate([a.scales, b.scales], axis=0)
+        if a.get("biases") is not None and b.get("biases") is not None:
+            fused.biases = mx.concatenate([a.biases, b.biases], axis=0)
+        return fused
+    if isinstance(a, nn.Linear) and isinstance(b, nn.Linear):
+        out_dims = int(a.weight.shape[0]) + int(b.weight.shape[0])
+        in_dims = int(a.weight.shape[1])
+        fused = nn.Linear(in_dims, out_dims, bias=False)
+        fused.weight = mx.concatenate([a.weight, b.weight], axis=0)
+        return fused
+    return None
+
+
+def _fuse_dflash2_projections(model: nn.Module) -> int:
+    """Fuse k_proj+v_proj -> kv_proj and gate_proj+up_proj -> gate_up_proj."""
+    fused_count = 0
+    for layer in getattr(model, "layers", ()):
+        attn = getattr(layer, "self_attn", None)
+        if (
+            attn is not None
+            and hasattr(attn, "k_proj")
+            and hasattr(attn, "v_proj")
+            and getattr(attn, "kv_proj", None) is None
+        ):
+            kv = _concat_linear_pair(attn.k_proj, attn.v_proj)
+            if kv is not None:
+                attn._k_dim = int(attn.n_kv_heads) * int(attn.head_dim)
+                attn.kv_proj = kv
+                del attn.k_proj
+                del attn.v_proj
+                fused_count += 1
+        mlp = getattr(layer, "mlp", None)
+        if (
+            mlp is not None
+            and hasattr(mlp, "gate_proj")
+            and hasattr(mlp, "up_proj")
+            and getattr(mlp, "gate_up_proj", None) is None
+        ):
+            gu = _concat_linear_pair(mlp.gate_proj, mlp.up_proj)
+            if gu is not None:
+                mlp.gate_up_proj = gu
+                del mlp.gate_proj
+                del mlp.up_proj
+                fused_count += 1
+    return fused_count
+
+
+def _bind_inkling2_dflash2(
+    model: nn.Module, raw_config: dict, target_model: Any
+) -> None:
+    """Bind Inkling 2 normed embeddings, vocab-masked lm_head and post-softcap."""
+    language_model = getattr(target_model, "language_model", target_model)
+    text = language_model.model
+    model.embed_tokens = lambda tokens: text.embed_norm(text.embed(tokens))
+    model.embed_scale = 1.0
+
+    lm_head = language_model.lm_head
+    vocab_bias = getattr(language_model, "_vocab_bias", None)
+    if vocab_bias is not None:
+        bias_dtype = _target_float_dtype(target_model) or mx.bfloat16
+        bias = vocab_bias.astype(bias_dtype)
+        mx.eval(bias)
+        model.lm_head = lambda hidden: lm_head(hidden) + bias
+    else:
+        model.lm_head = lm_head
+
+    dflash_cfg = raw_config.get("dflash_config") or {}
+    softcap_mode = dflash_cfg.get("selector_softcap_mode")
+    softcap = model.config.final_logit_softcapping
+    if softcap_mode == "after_correction" and softcap is not None:
+        model.candidate_selector.post_softcap = float(softcap)
+        model.config.final_logit_softcapping = None
+
+    fused = _fuse_dflash2_projections(model)
+    if fused:
+        logger.info("Inkling 2 DFlash2 fused %d projection pairs (kv + gate_up)", fused)
+
+
 def load_dflash_drafter(
     path: str,
     target_model: Any,
@@ -177,9 +353,20 @@ def load_dflash_drafter(
     checkpoint's context window.
     """
     adaptive = resolve_verify_mode(verify_mode)
-    model, kind = load_drafter(path, kind="dflash")
-    if kind != "dflash":
-        raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
+    local = get_model_path(path)
+    config = json.loads((local / "config.json").read_text())
+    inkling2_dflash2 = (
+        "DFlash2DraftModel" in (config.get("architectures") or ())
+        and _is_inkling2_target(target_model)
+    )
+    if inkling2_dflash2:
+        model = _load_inkling2_dflash2_model(local, config, target_model)
+    else:
+        model, kind = load_drafter(path, kind="dflash")
+        if kind != "dflash":
+            raise ValueError(
+                f"{path} resolved to drafter kind {kind!r}, expected 'dflash'"
+            )
     cast = match_target_dtype(model, target_model)
     if cast:
         logger.info("DFlash drafter cast to fp16 to match the target: %d arrays", cast)
@@ -191,8 +378,6 @@ def load_dflash_drafter(
             quant_bits,
             quant_group_size,
         )
-    local = get_model_path(path)
-    config = json.loads((local / "config.json").read_text())
     apply_partial_rope(model, config)
     mask_path = local / "mask_embedding.pt"
     mask_embedding = (
@@ -200,9 +385,11 @@ def load_dflash_drafter(
         if mask_path.is_file()
         else None
     )
+    if inkling2_dflash2:
+        _bind_inkling2_dflash2(model, config, target_model)
     # Laguna checks the target vocabulary through the tokenizer when the
     # target (an mlx-lm model) carries no config.
-    if (
+    elif (
         tokenizer is not None
         and "tokenizer" in inspect.signature(model.bind).parameters
     ):

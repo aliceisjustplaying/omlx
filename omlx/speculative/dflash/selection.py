@@ -130,16 +130,18 @@ def select_fused(selector, hidden, logits, anchors, samplers) -> list[tuple]:
     candidates = top_k_indices(logits, selector.top_k).astype(mx.int32)
     unary = mx.take_along_axis(logits, candidates, axis=-1)
     projected = selector.hidden_projection(hidden)
+    post_softcap = float(getattr(selector, "post_softcap", 0.0) or 0.0)
     params = mx.array(
         [
             (
-                [0.0, 0.0, 0.0, 0.0]
+                [0.0, 0.0, 0.0, 0.0, post_softcap]
                 if sampler is None
                 else [
                     float(getattr(sampler, "temp", 1.0) or 1.0),
                     float(getattr(sampler, "top_p", 0.0) or 0.0),
                     float(int(getattr(sampler, "top_k", 0) or 0)),
                     float(getattr(sampler, "min_p", 0.0) or 0.0),
+                    post_softcap,
                 ]
             )
             for sampler in samplers
@@ -147,7 +149,7 @@ def select_fused(selector, hidden, logits, anchors, samplers) -> list[tuple]:
         dtype=mx.float32,
     )
     pcb = selector.predecessor_codebook.weight
-    tokens, logq = select_kernel()(
+    tokens, logq, conf = select_kernel()(
         inputs=[
             candidates,
             unary,
@@ -161,8 +163,8 @@ def select_fused(selector, hidden, logits, anchors, samplers) -> list[tuple]:
         template=[("P", length), ("R", pcb.shape[-1])],
         grid=(32 * selector.top_k * batch, 1, 1),
         threadgroup=(32 * selector.top_k, 1, 1),
-        output_shapes=[(batch, length), (batch, length, selector.top_k)],
-        output_dtypes=[mx.int32, mx.float32],
+        output_shapes=[(batch, length), (batch, length, selector.top_k), (batch, length)],
+        output_dtypes=[mx.int32, mx.float32, mx.float32],
     )
     return [
         (
@@ -172,6 +174,7 @@ def select_fused(selector, hidden, logits, anchors, samplers) -> list[tuple]:
                 if sampler is None
                 else bg.SparseDraftQ(candidates[index], logq[index], vocab)
             ),
+            conf[index],
         )
         for index, sampler in enumerate(samplers)
     ]
@@ -195,6 +198,7 @@ def select_sampled(selector, hidden, logits, anchors, samplers) -> list[tuple]:
     candidates = top_k_indices(logits, selector.top_k)
     unary = mx.take_along_axis(logits, candidates, axis=-1)
     projected = selector.hidden_projection(hidden)
+    post_softcap = float(getattr(selector, "post_softcap", 0.0) or 0.0)
     predecessor = anchors.reshape(-1)
     tokens = [[] for _ in range(batch)]
     densities = [[] for _ in range(batch)]
@@ -206,6 +210,8 @@ def select_sampled(selector, hidden, logits, anchors, samplers) -> list[tuple]:
             axis=-1,
         )
         scores = unary[:, position] + edges  # (batch, top_k)
+        if post_softcap > 0.0:
+            scores = mx.tanh(scores.astype(mx.float32) / post_softcap) * post_softcap
         chosen = []
         for index, sampler in enumerate(samplers):
             if sampler is None:

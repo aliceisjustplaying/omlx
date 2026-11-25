@@ -82,10 +82,11 @@ _SELECT_SOURCE = """
     threadgroup int pred_tg;
     if (sg == 0 && lane == 0)
         pred_tg = anchors[b];
-    float temp = params[b * 4 + 0];
-    float top_p = params[b * 4 + 1];
-    int top_k = int(params[b * 4 + 2]);
-    float min_p = params[b * 4 + 3];
+    float temp = params[b * 5 + 0];
+    float top_p = params[b * 5 + 1];
+    int top_k = int(params[b * 5 + 2]);
+    float min_p = params[b * 5 + 3];
+    float post_softcap = params[b * 5 + 4];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int p = 0; p < P; ++p) {
         int row = int(b) * P + p;
@@ -100,8 +101,13 @@ _SELECT_SOURCE = """
             acc += float(pc[d]) * float(pj[d]) * float(sc[d]);
         }
         acc = simd_sum(acc);
-        if (lane == 0)
-            scores[sg] = float(unary[row * C + int(sg)]) + acc;
+        if (lane == 0) {
+            float s_raw = float(unary[row * C + int(sg)]) + acc;
+            if (post_softcap > 0.0f) {
+                s_raw = post_softcap * tanh(s_raw / post_softcap);
+            }
+            scores[sg] = s_raw;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
             bool live = int(lane) < C;
@@ -109,7 +115,10 @@ _SELECT_SOURCE = """
             float m = simd_max(s);
             int pick;
             float q = -INFINITY;
+            float c_val = 0.0f;
             if (temp <= 0.0f) {
+                float sum_exp = simd_sum(live ? exp(s - m) : 0.0f);
+                c_val = 1.0f / sum_exp;
                 pick = simd_min((live && s == m) ? int(lane) : C);
             } else {
                 float lp = s - m - log(simd_sum(live ? exp(s - m) : 0.0f));
@@ -141,6 +150,7 @@ _SELECT_SOURCE = """
                 float sm = simd_max(scaled);
                 float e = scaled == -INFINITY ? 0.0f : exp(scaled - sm);
                 float total = simd_sum(e);
+                c_val = 0.5f + 0.5f * (1.0f / total);
                 q = scaled == -INFINITY ? -INFINITY : scaled - sm - log(total);
                 float cdf = simd_prefix_inclusive_sum(e) / total;
                 float u = uniforms[row];
@@ -153,6 +163,7 @@ _SELECT_SOURCE = """
             if (lane == 0) {
                 int token = cand[row * C + pick];
                 tokens[row] = token;
+                conf[row] = c_val;
                 pred_tg = token;
             }
         }
@@ -177,7 +188,7 @@ def select_kernel():
                 "params",
                 "uniforms",
             ],
-            output_names=["tokens", "logq"],
+            output_names=["tokens", "logq", "conf"],
             source=_SELECT_SOURCE,
         )
     return _SELECT_KERNEL

@@ -115,18 +115,21 @@ def _attn_res_fused_kernel(
 {v_sq_acc}
     }}
     threadgroup float vred[Q][TG / 32];
+    threadgroup float vfold[Q];
     for (uint qi = 0; qi < Q; ++qi) {{
         float sv = simd_sum(v_sq[qi]);
         if (lane == 0) vred[qi][sg] = sv;
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_v[Q];
     float eps_n = scale[1];
-    for (uint qi = 0; qi < Q; ++qi) {{
+    if (tid < Q) {{
         float t = 0.0f;
-        for (uint j = 0; j < TG / 32; ++j) t += vred[qi][j];
-        inv_v[qi] = metal::rsqrt(t / float(H) + eps_n);
+        for (uint j = 0; j < TG / 32; ++j) t += vred[tid][j];
+        vfold[tid] = metal::rsqrt(t / float(H) + eps_n);
     }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_v[Q];
+    for (uint qi = 0; qi < Q; ++qi) inv_v[qi] = vfold[qi];
     it = 0u;
     for (uint h = tid; h < H; h += TG, ++it) {{
 {out_stores}
@@ -169,6 +172,8 @@ def _attn_res_fused_kernel(
         }}
     }}
     threadgroup float red[NS * Q + 1][TG / 32];
+    threadgroup float fold[NS * Q + 1];
+    threadgroup float sw[NS * Q];
     for (uint i = 0; i < NS * Q; ++i) {{
         float v = simd_sum(acc[i]);
         if (lane == 0) red[i][sg] = v;
@@ -178,27 +183,33 @@ def _attn_res_fused_kernel(
         if (lane == 0) red[NS * Q][sg] = ps;
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float ptot = 0.0f;
-    for (uint j = 0; j < TG / 32; ++j) ptot += red[NS * Q][j];
-    float inv_p = metal::rsqrt(ptot / float(H) + 1e-6f);
-    float sc = scale[0];
-    float w[NS * Q];
-    for (uint i = 0; i < NS * Q; ++i) {{
+    for (uint i = tid; i <= NS * Q; i += TG) {{
         float t = 0.0f;
         for (uint j = 0; j < TG / 32; ++j) t += red[i][j];
-        if (i >= {blocks} * Q) t *= inv_p;
-        w[i] = t * sc;
+        fold[i] = t;
     }}
-    for (uint qi = 0; qi < Q; ++qi) {{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_p = metal::rsqrt(fold[NS * Q] / float(H) + 1e-6f);
+    float sc = scale[0];
+    if (tid < Q) {{
+        float logits[NS];
         float m = -INFINITY;
-        for (uint n = 0; n < NS; ++n) m = max(m, w[n * Q + qi]);
+        for (uint n = 0; n < NS; ++n) {{
+            float t = fold[n * Q + tid];
+            if (n == {blocks}u) t *= inv_p;
+            logits[n] = t * sc;
+            m = max(m, logits[n]);
+        }}
         float z = 0.0f;
         for (uint n = 0; n < NS; ++n) {{
-            w[n * Q + qi] = metal::exp(w[n * Q + qi] - m);
-            z += w[n * Q + qi];
+            logits[n] = metal::exp(logits[n] - m);
+            z += logits[n];
         }}
-        for (uint n = 0; n < NS; ++n) w[n * Q + qi] /= z;
+        for (uint n = 0; n < NS; ++n) sw[n * Q + tid] = logits[n] / z;
     }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float w[NS * Q];
+    for (uint i = 0; i < NS * Q; ++i) w[i] = sw[i];
 {pass2}
 """
     kernel = mx.fast.metal_kernel(
@@ -857,6 +868,7 @@ _GQA_DECODE_PART_SOURCE = """
     threadgroup half Vs[BK * LDV];
 
     simdgroup_half8x8 Qf[D / 8];
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         float2 qv = float2(0.0f);
         if (row_ok) {
@@ -868,6 +880,7 @@ _GQA_DECODE_PART_SOURCE = """
         Qf[db].thread_elements()[1] = half(qv.y);
     }
     simdgroup_float8x8 Of[D / 8];
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         Of[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
@@ -968,8 +981,10 @@ _GQA_DECODE_PART_SOURCE = """
         }
 
         simdgroup_float8x8 Sf[BK / 8];
+        #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
             Sf[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma clang loop unroll(full)
             for (int db = 0; db < D / 8; ++db) {
                 simdgroup_half8x8 Kt;
                 simdgroup_load(Kt, Ks + db * 8 * LDK + kb * 8, LDK);
@@ -979,6 +994,7 @@ _GQA_DECODE_PART_SOURCE = """
 
         float rmax = -INFINITY;
         if (WINDOW == 0 && k0 >= lp && k0 + BK <= k_end && k0 + BK <= a_first - R + 1) {
+            #pragma clang loop unroll(full)
             for (int kb = 0; kb < BK / 8; ++kb) {
                 float s0 = row_ok ? Sf[kb].thread_elements()[0] * qscale : -INFINITY;
                 float s1 = row_ok ? Sf[kb].thread_elements()[1] * qscale : -INFINITY;
@@ -987,7 +1003,9 @@ _GQA_DECODE_PART_SOURCE = """
                 rmax = max(rmax, max(s0, s1));
             }
         } else {
+            #pragma clang loop unroll(full)
             for (int kb = 0; kb < BK / 8; ++kb) {
+                #pragma clang loop unroll(full)
                 for (int e = 0; e < 2; ++e) {
                     const int key = k0 + kb * 8 + fn + e;
                     const int d = a_row - key;
@@ -1013,7 +1031,9 @@ _GQA_DECODE_PART_SOURCE = """
             ? 0.0f : fast::exp2(m - m_new);
         float rsum = 0.0f;
         simdgroup_half8x8 Pf[BK / 8];
+        #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
+            #pragma clang loop unroll(full)
             for (int e = 0; e < 2; ++e) {
                 const float sv = Sf[kb].thread_elements()[e];
                 const float p = (sv == -INFINITY) ? 0.0f : fast::exp2(sv - m_new);
@@ -1025,9 +1045,11 @@ _GQA_DECODE_PART_SOURCE = """
         rsum += simd_shuffle_xor(rsum, 8);
         l = l * factor + rsum;
         m = m_new;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             Of[db].thread_elements()[0] *= factor;
             Of[db].thread_elements()[1] *= factor;
+            #pragma clang loop unroll(full)
             for (int kb = 0; kb < BK / 8; ++kb) {
                 simdgroup_half8x8 Vm;
                 simdgroup_load(Vm, Vs + kb * 8 * LDV + db * 8, LDV);
@@ -1040,6 +1062,7 @@ _GQA_DECODE_PART_SOURCE = """
         if (SINGLE) {
             const float inv = 1.0f / l;
             size_t base_o = (((size_t)b * HQ + h) * L + q_pos) * D;
+            #pragma clang loop unroll(full)
             for (int db = 0; db < D / 8; ++db) {
                 out_o[base_o + db * 8 + fn] = OT(Of[db].thread_elements()[0] * inv);
                 out_o[base_o + db * 8 + fn + 1] = OT(Of[db].thread_elements()[1] * inv);
@@ -1051,6 +1074,7 @@ _GQA_DECODE_PART_SOURCE = """
                 out_l[base_ml] = l;
             }
             size_t base_o = base_ml * D;
+            #pragma clang loop unroll(full)
             for (int db = 0; db < D / 8; ++db) {
                 out_o[base_o + db * 8 + fn] = OT(Of[db].thread_elements()[0]);
                 out_o[base_o + db * 8 + fn + 1] = OT(Of[db].thread_elements()[1]);
